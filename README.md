@@ -25,8 +25,8 @@ Esses wrappers precisam estar instalados, configurados e acessíveis no `PATH` (
 ## Instalação
 
 ```bash
-git clone https://github.com/vitorcamillo/git-revisor-public.git
-cd git-revisor-public
+git clone https://github.com/vitorcamillo/git-revisor.git
+cd git-revisor
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
