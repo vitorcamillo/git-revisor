@@ -51,6 +51,14 @@ IA APROVADO ou retomada) e o check rápido — `revisor.checkRapido`
 `revisor.checkRapidoCmd` (mesmo formato `@<pasta> cmd` de `revisor.check`)
 — roda antes da IA como filtro: se falhar, o commit é reprovado com o
 relatório do check sem chamar a IA.
+
+Check final selecionado: `revisor.checkFinal` escolhe entre `completo`
+(padrão) e `selecionado`. Com `selecionado`, o check final (que aprova
+o commit) usa a mesma seleção de testes do check rápido: cada check
+aplicável ao diff roda só os testes correspondentes aos arquivos
+alterados, e o check sem seleção possível roda inteiro (nunca é
+descartado). Alteração em arquivo de build/config (`pom.xml`,
+`pyproject.toml`, `package.json`, locks, etc.) força o check completo.
 """
 from __future__ import annotations
 
@@ -1800,6 +1808,124 @@ def _executar_checks(
     return True, ""
 
 
+def check_final_selecionado(topo: str | None = None) -> bool:
+    """`revisor.checkFinal` (padrão `completo`); só `selecionado` liga.
+
+    Valor (strip, lower) exatamente `selecionado` devolve True; vazio ou
+    `completo` devolve False; outro valor não vazio loga aviso e devolve
+    False (comportamento completo).
+    """
+    p = git(["config", "--get", "revisor.checkFinal"], cwd=topo)
+    valor = p.stdout.strip().lower() if p.returncode == 0 else ""
+    if valor == "selecionado":
+        return True
+    if valor and valor != "completo":
+        log(f"revisor.checkFinal inválido: {valor}; usando completo")
+    return False
+
+
+# globs (fnmatch sobre o caminho relativo e sobre o basename) de arquivos
+# de build/config cuja alteração força o check final completo
+ARQUIVOS_FORCAM_COMPLETO = (
+    "pom.xml", "*.gradle", "*.gradle.kts", "package.json",
+    "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "requirements*.txt", "pyproject.toml", "setup.cfg", "setup.py",
+    "conftest.py", "pytest.ini", "tox.ini",
+    "*/src/test/resources/*", "src/test/resources/*",
+)
+
+
+def _forca_completo(arquivo: str) -> bool:
+    """True se o arquivo alterado casa algum glob de ARQUIVOS_FORCAM_COMPLETO."""
+    base = arquivo.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(arquivo, glob)
+               or fnmatch.fnmatch(base, glob)
+               for glob in ARQUIVOS_FORCAM_COMPLETO)
+
+
+def _rodar_checks_selecionados(sha: str, topo: str,
+                               arquivos: list[str]) -> tuple[bool, str]:
+    """Check final com seleção de testes (`revisor.checkFinal=selecionado`).
+
+    Mesma origem de checks que `rodar_checks` (manuais de `revisor.check`,
+    senão detectados por `detectar_checks` com `revisor.autoCheck`; ignora
+    `revisor.checkRapidoCmd`), filtrados por `_check_cobre`. Cada check
+    passa por `selecionar_teste_rapido`; sem seleção possível, roda o
+    comando original completo (o check nunca é descartado). Mesmo
+    worktree, lock, espera de `TEMPO_ESPERA_CHECK`, timeout e cache por
+    árvore do check completo; os logs de execução usam o prefixo
+    `check-selecionado`. Ignora `revisor.checkRapido`.
+    """
+    p_timeout = git(["config", "--get", "revisor.checkTimeout"], cwd=topo)
+    try:
+        timeout_check = max(1, int(p_timeout.stdout.strip()))
+    except ValueError:
+        timeout_check = 1200
+    cache_ligado = cache_checks_ativo(topo)
+    arvore = None
+    if cache_ligado:
+        try:
+            arvore = arvore_de(sha)
+        except RuntimeError as exc:
+            log(f"cache de checks inativo nesta rodada: {exc}")
+
+    def _fechar_pulos(pulos: list[str]) -> None:
+        """Uma linha só com os motivos de pulo, sem repetir igual."""
+        vistos: list[str] = []
+        for motivo in pulos:
+            if motivo not in vistos:
+                vistos.append(motivo)
+        if vistos:
+            log("checks pulados: " + "; ".join(vistos))
+
+    p = git(["config", "--get-all", "revisor.check"], cwd=topo)
+    brutos = ([linha.strip() for linha in p.stdout.splitlines()
+               if linha.strip()] if p.returncode == 0 else [])
+    manuais: list[tuple[str, list[str], str, bool]] = []
+    for bruto in brutos:
+        parsed = _parse_check_manual(bruto)
+        if parsed is not None:
+            manuais.append((parsed[0], parsed[1], parsed[2], True))
+    with worktree_checks(sha, topo) as tmp:
+        pulos: list[str] = []
+        if manuais:
+            origem = [c for c in manuais if _check_cobre(c[0], arquivos)]
+        else:
+            if not _auto_check_ativo(topo):
+                _fechar_pulos(pulos)
+                return True, ""
+            detectados = detectar_checks(tmp, topo, pulos)
+            origem = [(prefixo, lista, cwd_rel, False)
+                      for prefixo, lista, cwd_rel in detectados
+                      if _check_cobre(prefixo, arquivos)]
+        if not origem:
+            log("checks: nenhum cobre os arquivos alterados")
+            _fechar_pulos(pulos)
+            return True, ""
+        comandos: list[tuple[str, list[str], str, bool]] = []
+        existentes = [a for a in arquivos if os.path.exists(os.path.join(tmp, a))]
+        for prefixo, lista, cwd_rel, eh_manual in origem:
+            selecionado = selecionar_teste_rapido(prefixo, lista, existentes,
+                                                  raiz=tmp)
+            efetivo = selecionado if selecionado is not None else lista
+            comandos.append((prefixo, efetivo, cwd_rel, eh_manual))
+        with trava(TEMPO_ESPERA_CHECK,
+                   arquivo=arquivo_trava_checks()) as livre:
+            if not livre:
+                ok, rel = False, (f"{CHECK_OCUPADO} por mais de "
+                                  f"{TEMPO_ESPERA_CHECK // 60} min")
+                log(rel)
+            else:
+                kwargs = ({"arvore": arvore, "topo": topo}
+                          if arvore else {})
+                ok, rel = _executar_checks(comandos, tmp, timeout_check,
+                                           pulos,
+                                           rotulo_log="check-selecionado",
+                                           **kwargs)
+        _fechar_pulos(pulos)
+        return ok, rel
+
+
 def rodar_checks(sha: str, topo: str,
                  base: str | None = None) -> tuple[bool, str]:
     """Roda os checks num worktree temporário de `sha`.
@@ -1818,7 +1944,9 @@ def rodar_checks(sha: str, topo: str,
     esgotar. Com `revisor.cacheChecks` ligado (padrão), check já aprovado
     para a árvore de `sha` é pulado e, estando todos em cache, devolve
     (True, "") sem criar worktree nem pegar o lock. Worktrees temporários
-    são removidos; o persistente é mantido.
+    são removidos; o persistente é mantido. Com `revisor.checkFinal=
+    selecionado` e nenhum arquivo de build/config no diff, delega para
+    `_rodar_checks_selecionados`.
     """
     if base is None:
         base = pai1_ou_vazio(sha)
@@ -1828,6 +1956,12 @@ def rodar_checks(sha: str, topo: str,
                            f"{p_diff.stderr.strip()[:300]}")
     arquivos = [linha.strip() for linha in p_diff.stdout.splitlines()
                 if linha.strip()]
+    if check_final_selecionado(topo):
+        if any(_forca_completo(a) for a in arquivos):
+            log("check final: arquivo de build/config alterado; "
+                "rodando completo")
+        else:
+            return _rodar_checks_selecionados(sha, topo, arquivos)
     p = git(["config", "--get-all", "revisor.check"], cwd=topo)
     brutos = ([linha.strip() for linha in p.stdout.splitlines()
                if linha.strip()] if p.returncode == 0 else [])
