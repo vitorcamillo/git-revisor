@@ -38,6 +38,11 @@ detectado) é pulada sem reprovar. `revisor.worktreePersistente`
 do repositório e `revisor.cacheChecks` (padrão `true`) guarda por
 árvore os checks já aprovados, pulando o que já passou igual.
 
+Cache de veredito por parte: `revisor.cacheParte` (padrão `true`; só
+`false` desliga) guarda o APROVADO de cada parte do diff por conteúdo —
+parte idêntica reaproveita o cache sem chamar a IA de novo, inclusive
+em rodada de correção.
+
 Ordem de revisão: `revisor.ordem` escolhe entre `ia-primeiro` (padrão) e
 `check-primeiro` (rollback: check completo antes da IA, ordem antiga).
 Em `ia-primeiro`, o check completo só roda antes de aprovar (risco baixo,
@@ -2061,7 +2066,10 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
     Qualquer REPROVADO reprova o conjunto (relatório = concatenação das partes
     reprovadas); SEM_COTA/ERRO/INCONCLUSIVO vale para o todo. Acima de
     MAX_PARTES nem chama o revisor: mudança grande demais para aprovar.
-    Devolve também as famílias do revisor de cada parte efetivamente revisada.
+    Parte já APROVADA e em cache (`revisor.cacheParte`) conta como aprovada
+    sem chamar a IA, inclusive em rodada de correção; só as partes sem cache
+    vão para o revisor. Devolve também as famílias do revisor de cada parte,
+    as revisadas agora e as vindas do cache.
     """
     partes = dividir_em_partes(texto)
     total = len(partes)
@@ -2073,44 +2081,68 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
     except ValueError:
         paralelo = 3
 
-    prompts = [
-        montar_prompt(
-            parte, repo, commits, relatorio_anterior,
-            f"PARTE {i} de {total}. Cada parte é revisada numa chamada separada e "
-            "independente: revise SÓ esta parte agora e termine com o "
-            "VEREDITO; não espere as outras partes.",
+    chaves = [chave_parte(parte, risco_alto, contexto_repo) for parte in partes]
+    familia_cache: dict[int, str] = {}
+    if cache_parte_ativo(repo) and cache_veredito_ativo(repo):
+        for i, chave in enumerate(chaves):
+            familia = ler_cache_parte(chave)
+            if familia is not None:
+                familia_cache[i] = familia
+    n_cache = len(familia_cache)
+    for i in sorted(familia_cache):
+        log(f"parte {i + 1}/{total} em cache ({chaves[i][:12]})")
+    if n_cache == total:
+        return ("APROVADO", f"aprovado em {total} parte(s) ({n_cache} do cache)",
+                set(familia_cache.values()))
+
+    pendentes = [i for i in range(total) if i not in familia_cache]
+    prompts = {
+        i: montar_prompt(
+            partes[i], repo, commits, relatorio_anterior,
+            f"PARTE {i + 1} de {total}. Cada parte é revisada numa chamada "
+            "separada e independente: revise SÓ esta parte agora e termine "
+            "com o VEREDITO; não espere as outras partes.",
             contexto, risco_alto=risco_alto,
             intencao=intencao, evidencia=evidencia,
             contexto_repo=contexto_repo)
-        for i, parte in enumerate(partes, 1)
-    ]
+        for i in pendentes
+    }
+    autorreferida = set(MESMO_MODELO) | {"desconhecido"}
+    mensagem = f"aprovado em {total} parte(s)"
+    if n_cache:
+        mensagem += f" ({n_cache} do cache)"
 
     if total > 1 and paralelo > 1:
-        futuros: list[concurrent.futures.Future] = []
+        futuros: dict[int, concurrent.futures.Future] = {}
         resultados: list[tuple[str, str] | None] = [None] * total
         primeiro_inconclusivo: int | None = None
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(paralelo, total)) as executor:
-            futuros = [executor.submit(revisar_com_ia, prompt, repo)
-                       for prompt in prompts]
-            for i, futuro in enumerate(futuros):
-                resultados[i] = futuro.result()
+                max_workers=min(paralelo, len(pendentes))) as executor:
+            futuros = {i: executor.submit(revisar_com_ia, prompts[i], repo)
+                       for i in pendentes}
+            for pos, i in enumerate(pendentes):
+                resultados[i] = futuros[i].result()
                 if resultados[i][0] not in ("APROVADO", "REPROVADO"):
                     primeiro_inconclusivo = i
-                    for pendente in futuros[i + 1:]:
-                        pendente.cancel()
+                    for j in pendentes[pos + 1:]:
+                        futuros[j].cancel()
                     break
-            for i, futuro in enumerate(futuros):
+            for i, futuro in futuros.items():
                 if resultados[i] is None and futuro.done() and not futuro.cancelled():
                     try:
                         resultados[i] = futuro.result()
                     except Exception:
                         # Uma parte posterior não altera falha já encontrada.
                         pass
-        familias = {
+        familias = set(familia_cache.values())
+        familias |= {
             familia_revisor(resultado[1])
             for resultado in resultados if resultado is not None
         }
+        for i, resultado in enumerate(resultados):
+            if (resultado is not None and resultado[0] == "APROVADO"
+                    and familia_revisor(resultado[1]) not in autorreferida):
+                gravar_cache_parte(chaves[i], resultado[1])
         if primeiro_inconclusivo is not None:
             resultado = resultados[primeiro_inconclusivo]
             assert resultado is not None
@@ -2119,20 +2151,83 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
                       if resultado is not None and resultado[0] == "REPROVADO"]
         if reprovadas:
             return "REPROVADO", "\n\n".join(reprovadas), familias
-        return "APROVADO", f"aprovado em {total} parte(s)", familias
+        return "APROVADO", mensagem, familias
 
     reprovadas: list[str] = []
-    familias: set[str] = set()
-    for prompt in prompts:
-        veredito, saida = revisar_com_ia(prompt, repo)
-        familias.add(familia_revisor(saida))
-        if veredito == "REPROVADO":
+    familias = set(familia_cache.values())
+    for i in pendentes:
+        veredito, saida = revisar_com_ia(prompts[i], repo)
+        familia = familia_revisor(saida)
+        familias.add(familia)
+        if veredito == "APROVADO":
+            if familia not in autorreferida:
+                gravar_cache_parte(chaves[i], saida)
+        elif veredito == "REPROVADO":
             reprovadas.append(saida)
-        elif veredito != "APROVADO":
+        else:
             return veredito, saida, familias
     if reprovadas:
         return "REPROVADO", "\n\n".join(reprovadas), familias
-    return "APROVADO", f"aprovado em {total} parte(s)", familias
+    return "APROVADO", mensagem, familias
+
+
+# --------------------------------------------------- cache de veredito (partes)
+
+VERSAO_CACHE_PARTE = 1
+
+
+def cache_parte_ativo(topo: str | None = None) -> bool:
+    """`revisor.cacheParte` (padrão true); só `false` desliga o cache de parte."""
+    p = git(["config", "--get", "revisor.cacheParte"], cwd=topo)
+    valor = p.stdout.strip() if p.returncode == 0 else ""
+    return (valor or "true").lower() != "false"
+
+
+def chave_parte(parte: str, risco_alto: list[str] | None,
+                contexto_repo: str | None) -> str:
+    """Chave sha256 da parte: texto, risco alto, contexto do repo e versão.
+
+    `relatorio_anterior`, `commits`, `contexto`, `intencao`, `evidencia` e o
+    rótulo "PARTE i de N" ficam fora: o veredito depende só do conteúdo.
+    """
+    dados = {"parte": parte, "risco": sorted(risco_alto or []),
+             "contexto_repo": contexto_repo or "",
+             "versao": VERSAO_CACHE_PARTE}
+    return hashlib.sha256(json.dumps(
+        dados, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def caminho_cache_parte(chave: str) -> Path:
+    """Arquivo do veredito em cache para o conteúdo da parte."""
+    return base_dir() / "partes" / chave
+
+
+def ler_cache_parte(chave: str) -> str | None:
+    """Família gravada para a parte em cache; None se ausente ou inválido."""
+    try:
+        dados = json.loads(
+            caminho_cache_parte(chave).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None  # JSON inválido = sem cache
+    if (isinstance(dados, dict) and isinstance(dados.get("resumo"), str)
+            and isinstance(dados.get("familia"), str)):
+        return dados["familia"]
+    return None
+
+
+def gravar_cache_parte(chave: str, resumo: str) -> None:
+    """Grava o veredito APROVADO da parte (1 linha JSON, atômico)."""
+    try:
+        pasta = base_dir() / "partes"
+        pasta.mkdir(parents=True, exist_ok=True)
+        dados = {"quando": agora_iso(), "resumo": resumo,
+                 "familia": familia_revisor(resumo)}
+        temporario = pasta / f"{chave}.tmp"
+        temporario.write_text(json.dumps(dados, ensure_ascii=False) + "\n",
+                              encoding="utf-8")
+        os.replace(temporario, pasta / chave)
+    except (OSError, RuntimeError) as exc:
+        log(f"cache de parte não gravado: {exc}")
 
 
 # --------------------------------------------------- cache de veredito (árvores)

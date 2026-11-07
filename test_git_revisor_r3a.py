@@ -138,6 +138,7 @@ def test_cache_desligado_chama_ia_de_novo(
 def test_relatorio_anterior_ignora_leitura_do_cache(
         repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Rodada de correção não lê o cache, mas grava para rodadas futuras."""
+    _git(repo, "config", "revisor.cacheParte", "false")
     estado = _ia_contada(monkeypatch)
     sha_base = _commit(repo, {"a.txt": "1\n"}, "feat: base")
     sha = _commit(repo, {"b.txt": "2\n"}, "feat: b")
