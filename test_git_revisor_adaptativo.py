@@ -132,12 +132,24 @@ def test_executar_checks_define_preexec_prioridade(
     """O subprocesso do check recebe o ajuste de prioridade do build."""
     chamadas: list[dict] = []
 
-    def _run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
-        """Captura argumentos e simula check aprovado."""
-        chamadas.append(kwargs)
-        return subprocess.CompletedProcess(args, 0, "", "")
+    class _ProcFalso:
+        """Popen mínimo: sai 0 na primeira communicate."""
 
-    monkeypatch.setattr(mod.subprocess, "run", _run)
+        pid = 1
+        returncode = 0
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            """Simula fim imediato do check aprovado."""
+            return "", ""
+
+    def _popen(*args: object, _real=subprocess.Popen, **kwargs: object):
+        """Captura argumentos e simula check aprovado."""
+        if list(args[0])[:1] != ["check-falso"]:
+            return _real(*args, **kwargs)
+        chamadas.append(kwargs)
+        return _ProcFalso()
+
+    monkeypatch.setattr(mod.subprocess, "Popen", _popen)
     checks = [("", ["check-falso"], "", True)]
     assert mod._executar_checks(checks, str(tmp_path), 1) == (True, "")
     assert chamadas[0]["preexec_fn"] is mod._baixar_prioridade
@@ -197,20 +209,46 @@ def test_rodar_checks_exit_75_segura(repo: Path,
 
 def _subprocess_falso(monkeypatch: pytest.MonkeyPatch, retorno: int = 0,
                       stdout: str = "", stderr: str = "") -> list:
-    """Troca subprocess.run registrando comandos que não são git."""
+    """Troca subprocess.run/Popen registrando comandos que não são git."""
     registros: list = []
     real_run = subprocess.run
+    real_popen = subprocess.Popen
 
-    def _falso(comando, *args: object, **kwargs: object):
+    class _ProcFalso:
+        """Popen mínimo: pid e returncode fixos, communicate imediato."""
+
+        def __init__(self, lista: list[str]) -> None:
+            self.pid = 1
+            self.returncode = retorno
+
+        def communicate(
+                self, timeout: float | None = None) -> tuple[str, str]:
+            """Devolve a saída fixada sem rodar nada."""
+            return stdout, stderr
+
+    def _lista_de(comando: object) -> list[str]:
+        """Normaliza comando (str ou sequência) em lista de strings."""
+        return (list(comando) if isinstance(comando, (list, tuple))
+                else [str(comando)])
+
+    def _falso_run(comando, *args: object, **kwargs: object):
         """Delega git ao subprocess real e finge o resto com `retorno`."""
-        lista = (list(comando) if isinstance(comando, (list, tuple))
-                 else [str(comando)])
+        lista = _lista_de(comando)
         if lista and lista[0] == "git":
             return real_run(comando, *args, **kwargs)  # type: ignore[arg-type]
         registros.append(lista)
         return subprocess.CompletedProcess(lista, retorno, stdout, stderr)
 
-    monkeypatch.setattr(mod.subprocess, "run", _falso)
+    def _falso_popen(comando, *args: object, **kwargs: object):
+        """Delega git ao Popen real e finge o resto sem rodar o comando."""
+        lista = _lista_de(comando)
+        if lista and lista[0] == "git":
+            return real_popen(comando, *args, **kwargs)  # type: ignore[arg-type]
+        registros.append(lista)
+        return _ProcFalso(lista)
+
+    monkeypatch.setattr(mod.subprocess, "run", _falso_run)
+    monkeypatch.setattr(mod.subprocess, "Popen", _falso_popen)
     return registros
 
 

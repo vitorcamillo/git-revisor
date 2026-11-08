@@ -2000,10 +2000,12 @@ def _executar_checks(
     Com `abortar` (suíte completa em fundo), cada comando roda via Popen
     com polling de ~5 s: se `abortar()` ficar True (ex.: push esperando),
     o grupo do comando recebe SIGTERM (depois SIGKILL) e a execução
-    devolve `CHECK_CEDIDO` sem reprovar. Sem `abortar`, o comportamento
-    é o de sempre (`subprocess.run`) e a espera por memória da repetição
-    estrita usa o limite curto `ESPERA_MEMORIA_SEM_ABORTAR_S`: sem como
-    ceder a vez, não prender o lock de checks por 600 s.
+    devolve `CHECK_CEDIDO` sem reprovar. Sem `abortar`, o mesmo caminho
+    de Popen com polling é usado (no timeout mata o grupo inteiro —
+    `subprocess.run` deixaria netos tipo `npm → sh → jest` órfãos); a
+    espera por memória da repetição estrita usa o limite curto
+    `ESPERA_MEMORIA_SEM_ABORTAR_S`: sem como ceder a vez, não prender o
+    lock de checks por 600 s.
     """
     coletor = pulos if pulos is not None else []
     cache_ligado = bool(arvore) and cache_checks_ativo(topo)
@@ -2071,15 +2073,12 @@ def _executar_checks(
         def _rodar() -> subprocess.CompletedProcess | None:
             """Uma execução do check, com prioridade baixada.
 
-            Com `abortar`, roda via Popen com polling de ~5 s para poder
-            ceder a vez a um push; devolve None quando cedeu.
+            Sempre via Popen com polling (mesmo sem `abortar`): no timeout
+            o grupo inteiro recebe SIGTERM e, persistindo, SIGKILL —
+            `subprocess.run` mataria só o filho direto e netos tipo
+            `npm → sh → jest` ficariam órfãos comendo CPU. Devolve None
+            quando `abortar()` pediu a vez.
             """
-            if abortar is None:
-                return subprocess.run(lista, cwd=cwd_exec,
-                                      env=env_limpo(), capture_output=True,
-                                      text=True, timeout=timeout_check,
-                                      start_new_session=True,
-                                      preexec_fn=_baixar_prioridade)
             return _rodar_polling()
 
         inicio = time.monotonic()

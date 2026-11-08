@@ -90,16 +90,29 @@ def test_falha_infra_forked_vm_e_killed() -> None:
 
 def _checks_fake(monkeypatch: pytest.MonkeyPatch, codigos: list[tuple[int, str]],
                  tmp: Path) -> dict:
-    """Troca subprocess.run por fake que devolve (código, saída) em sequência."""
+    """Troca subprocess.Popen por fake que devolve (código, saída) em sequência."""
     estado: dict = {"execucoes": 0, "fila": list(codigos)}
     logs: list[str] = []
 
-    def fake_run(lista, **kwargs):
+    class _ProcPopen:
+        """Popen mínimo: communicate devolve a saída da fila e sai."""
+
+        pid = 1
+
+        def __init__(self, codigo: int, saida: str) -> None:
+            self.returncode = codigo
+            self._saida = saida
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            """Simula fim imediato do check."""
+            return self._saida, ""
+
+    def fake_popen(lista, **kwargs):
         estado["execucoes"] += 1
         codigo, saida = estado["fila"].pop(0)
-        return _Proc(codigo, saida, "")
+        return _ProcPopen(codigo, saida)
 
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(mod, "log", logs.append)
     monkeypatch.setattr(mod, "esperar_memoria",
                         lambda limite_s=600, **_k: True)
