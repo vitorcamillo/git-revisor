@@ -78,6 +78,16 @@ descartado). Seleção que degradou para comando sem teste nenhum
 comando original completo quando o diff toca código; alteração em
 arquivo de build/config (`pom.xml`, `pyproject.toml`, `package.json`,
 locks, etc.) força o check completo.
+
+Suíte completa em fundo: com `revisor.checkFinal=selecionado`, o push
+aprovado dispara em segundo plano (subcomando `suite-completa`) a
+suíte COMPLETA da árvore enviada, quando ela ainda não está no cache
+de checks (suíte anterior de outra árvore é morta e substituída — a
+árvore nova contém a antiga). A suíte espera a máquina liberar, cede a
+vez a um push que aparecer e, se falhar de verdade, registra
+`suite-falhou.json` e notifica: o PRÓXIMO push, mesmo com
+`selecionado`, roda então o check completo e só passa com ele verde —
+o que apaga a falha registrada.
 """
 from __future__ import annotations
 
@@ -100,7 +110,7 @@ import traceback
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 # todos os hooks que o git chama pela pasta de hooks, para encaminhar ao hook
 # local do repositório (fsmonitor-watchman fica fora: é configurado por core.fsmonitor)
@@ -154,7 +164,8 @@ TRAILER_WORKER = "Revisor-Worker"
 SEM_HERDAR = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
 USO = ("uso: git revisor hook pre-commit|post-commit|pre-push <remote> <url> | "
        "revisar <sha> | revisar-adiado <sha> | corrigir <sha> | "
-       "corrigir-push <sha> | retentar-push <sha> | pendentes | "
+       "corrigir-push <sha> | retentar-push <sha> | suite-completa <sha> | "
+       "pendentes | "
        "status [<sha>] | ligar | desligar | instalar | desinstalar | limpar")
 
 
@@ -366,16 +377,23 @@ def motivo_veredito(veredito: str) -> str:
 CHECK_OCUPADO = "check não rodou: lock de checks ocupado"
 CHECK_SEM_RECURSO = "check não rodou: sem recurso na máquina (RAM/kill)"
 CHECK_SEM_FERRAMENTA = "check não rodou: ferramenta ausente"
+# suíte completa em fundo cedeu a vez a um push que apareceu
+CHECK_CEDIDO = "check interrompido: push esperando"
+# impresso pelo hook quando o push é segurado por lock/infra (retentável);
+# retentar-push reconhece uma retentativa segurada DE NOVO por esse texto
+MARCADOR_PUSH_SEGURADO = "push segurado: os testes não puderam rodar agora"
 
 
 def check_ocupado(relatorio: str) -> bool:
     """True se o relatório indica check completo que NÃO rodou (pulo válido).
 
-    Cobre lock ocupado, falta de recurso e ferramenta ausente: em todos,
-    o push é bloqueado sem salvar reprovação e sem acionar o corretor.
+    Cobre lock ocupado, falta de recurso, ferramenta ausente e o check
+    cedido a um push: em todos, o push é bloqueado sem salvar reprovação
+    e sem acionar o corretor.
     """
     return relatorio.startswith(
-        (CHECK_OCUPADO, CHECK_SEM_RECURSO, CHECK_SEM_FERRAMENTA))
+        (CHECK_OCUPADO, CHECK_SEM_RECURSO, CHECK_SEM_FERRAMENTA,
+         CHECK_CEDIDO))
 
 
 def check_sem_ferramenta(relatorio: str) -> bool:
@@ -1939,7 +1957,8 @@ def _executar_checks(
         arvore: str | None = None,
         topo: str | None = None,
         rotulo_log: str = "check",
-        estrito: bool = False) -> tuple[bool, str]:
+        estrito: bool = False,
+        abortar: Callable[[], bool] | None = None) -> tuple[bool, str]:
     """Roda os checks no worktree `tmp`; o primeiro reprovado interrompe.
 
     Com cache ligado e `arvore` dada, check já aprovado para a árvore é
@@ -1954,6 +1973,12 @@ def _executar_checks(
     devolve `CHECK_SEM_FERRAMENTA`. No modo normal (check rápido), falha
     de infra — incluindo a JVM morta do surefire — vira pulo, nunca
     REPROVADO. pytest sem testes (exit 5) é aceito nos dois modos.
+
+    Com `abortar` (suíte completa em fundo), cada comando roda via Popen
+    com polling de ~5 s: se `abortar()` ficar True (ex.: push esperando),
+    o grupo do comando recebe SIGTERM (depois SIGKILL) e a execução
+    devolve `CHECK_CEDIDO` sem reprovar. Sem `abortar`, o comportamento
+    é o de sempre (`subprocess.run`).
     """
     coletor = pulos if pulos is not None else []
     cache_ligado = bool(arvore) and cache_checks_ativo(topo)
@@ -1978,13 +2003,59 @@ def _executar_checks(
                 continue
         cwd_exec = str(Path(tmp) / cwd_relativo) if cwd_relativo else tmp
 
-        def _rodar() -> subprocess.CompletedProcess:
-            """Uma execução do check, com prioridade baixada."""
-            return subprocess.run(lista, cwd=cwd_exec,
-                                  env=env_limpo(), capture_output=True,
-                                  text=True, timeout=timeout_check,
-                                  start_new_session=True,
-                                  preexec_fn=_baixar_prioridade)
+        def _matar_grupo(proc: subprocess.Popen) -> tuple[str, str]:
+            """SIGTERM no grupo e, persistindo, SIGKILL; devolve a saída."""
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                saida, erro = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+                return "", ""
+            return saida or "", erro or ""
+
+        def _rodar_polling() -> subprocess.CompletedProcess | None:
+            """Roda via Popen com polling; None se `abortar()` pedir a vez."""
+            proc = subprocess.Popen(
+                lista, cwd=cwd_exec, env=env_limpo(),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True, preexec_fn=_baixar_prioridade)
+            prazo = time.monotonic() + timeout_check
+            while True:
+                try:
+                    saida, erro = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    return subprocess.CompletedProcess(
+                        lista, proc.returncode, saida, erro)
+                if abortar is not None and abortar():
+                    _matar_grupo(proc)
+                    return None
+                if time.monotonic() >= prazo:
+                    saida, erro = _matar_grupo(proc)
+                    raise subprocess.TimeoutExpired(
+                        lista, timeout_check, output=saida, stderr=erro)
+
+        def _rodar() -> subprocess.CompletedProcess | None:
+            """Uma execução do check, com prioridade baixada.
+
+            Com `abortar`, roda via Popen com polling de ~5 s para poder
+            ceder a vez a um push; devolve None quando cedeu.
+            """
+            if abortar is None:
+                return subprocess.run(lista, cwd=cwd_exec,
+                                      env=env_limpo(), capture_output=True,
+                                      text=True, timeout=timeout_check,
+                                      start_new_session=True,
+                                      preexec_fn=_baixar_prioridade)
+            return _rodar_polling()
 
         inicio = time.monotonic()
         try:
@@ -2010,6 +2081,10 @@ def _executar_checks(
                 bruto_err = bruto_err.decode("utf-8", "ignore")
             return False, _relatorio_check(comando_str, "timeout",
                                            bruto_out + bruto_err, prefixo)
+        if proc is None:
+            motivo = f"{CHECK_CEDIDO}: {comando_str} em {prefixo or '.'}"
+            log(motivo)
+            return False, motivo
         dur = time.monotonic() - inicio
         rotulo = proc.returncode
         log(f"{rotulo_log} exit={rotulo} dur={dur:.1f}s "
@@ -2041,6 +2116,10 @@ def _executar_checks(
                     bruto_err = bruto_err.decode("utf-8", "ignore")
                 return False, _relatorio_check(comando_str, "timeout",
                                                bruto + bruto_err, prefixo)
+            if proc is None:
+                motivo = f"{CHECK_CEDIDO}: {comando_str} em {prefixo or '.'}"
+                log(motivo)
+                return False, motivo
             dur = time.monotonic() - inicio
             log(f"{rotulo_log} exit={proc.returncode} dur={dur:.1f}s "
                 f"pasta={prefixo or '.'} cmd={comando_str[:120]} "
@@ -2244,8 +2323,213 @@ def _rodar_checks_selecionados(sha: str, topo: str,
         return ok, rel
 
 
-def rodar_checks(sha: str, topo: str,
-                 base: str | None = None) -> tuple[bool, str]:
+# ------------------------------------------------- suíte completa em fundo
+
+def suite_completa_em_cache(sha: str, topo: str, base: str) -> bool:
+    """True se os checks completos da árvore de `sha` já passaram.
+
+    Monta os mesmos checks que `rodar_checks` rodaria no caminho completo
+    (manuais de `revisor.check` cobrindo o diff; senão os detectados, via
+    cache de detecção) e testa o marcador de cache de todos; sem nenhum
+    check aplicável, True. Com `revisor.cacheChecks` desligado nunca há
+    cache: False.
+    """
+    if not cache_checks_ativo(topo):
+        return False
+    p = git(["diff", "--name-only", base, sha], cwd=topo)
+    if p.returncode != 0:
+        return False
+    arquivos = [l.strip() for l in p.stdout.splitlines() if l.strip()]
+    p = git(["config", "--get-all", "revisor.check"], cwd=topo)
+    brutos = ([l.strip() for l in p.stdout.splitlines() if l.strip()]
+              if p.returncode == 0 else [])
+    manuais: list[tuple[str, list[str], str]] = []
+    for bruto in brutos:
+        parsed = _parse_check_manual(bruto)
+        if parsed is not None:
+            manuais.append(parsed)
+    try:
+        arvore = arvore_de(sha)
+    except RuntimeError:
+        return False
+    if manuais:
+        filtrados = [c for c in manuais if _check_cobre(c[0], arquivos)]
+        if not filtrados:
+            return True
+        return all(caminho_cache_check(
+            arvore, chave_check(c[0], c[1], c[2])).exists()
+            for c in filtrados)
+    if not _auto_check_ativo(topo):
+        return True
+    return _deteccao_toda_em_cache(arvore, arquivos)
+
+
+def disparar_suite_completa(local_sha: str, base: str, topo: str) -> None:
+    """Dispara `suite-completa <local_sha>` desacoplado, se couber.
+
+    Grava `suite-fundo.json` em `base_dir()` (sha, base, pid, quando).
+    Suíte anterior de OUTRO sha com pid vivo é morta (SIGTERM no grupo) e
+    substituída — a árvore nova contém a antiga; mesmo sha com pid vivo
+    não dispara de novo.
+    """
+    caminho = base_dir() / "suite-fundo.json"
+    dados_ant = _ler_json(caminho)
+    if dados_ant:
+        pid_ant = dados_ant.get("pid")
+        if isinstance(pid_ant, int) and pid_ant > 0:
+            try:
+                os.kill(pid_ant, 0)
+            except PermissionError:
+                return  # de outro usuário e vivo: não mexer
+            except (ProcessLookupError, OSError):
+                pass  # pid morto: pode substituir
+            else:
+                if dados_ant.get("sha") == local_sha:
+                    return  # mesma árvore já rodando
+                try:
+                    os.killpg(pid_ant, signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
+    dados = {"sha": local_sha, "base": base, "quando": agora_iso()}
+    try:
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+        caminho.write_text(json.dumps(dados, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+    except OSError as exc:
+        log(f"suíte em fundo: não consegui gravar {caminho}: {exc}")
+        return
+    try:
+        arq_log = (base_dir() / "log.txt").open("a", encoding="utf-8")
+    except OSError as exc:
+        log(f"suíte em fundo: não consegui abrir o log: {exc}")
+        return
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()),
+             "suite-completa", local_sha],
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=arq_log, stderr=arq_log, cwd=topo)
+    except OSError as exc:
+        log(f"suíte em fundo: não consegui disparar: {exc}")
+        return
+    finally:
+        try:
+            arq_log.close()
+        except OSError:
+            pass
+    try:
+        dados["pid"] = proc.pid
+        caminho.write_text(json.dumps(dados, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+    except OSError:
+        pass
+    log(f"suíte completa em fundo disparada para {sha7(local_sha)} "
+        f"(pid {proc.pid})")
+
+
+def disparar_suite_fundo_se_preciso(novos: list[str], local_sha: str,
+                                    topo: str, base: str) -> None:
+    """Dispara a suíte completa em fundo após um push APROVADO.
+
+    Só com `revisor.checkFinal=selecionado` e sem os checks completos da
+    árvore já em cache (ver `suite_completa_em_cache`).
+    """
+    if not novos or not check_final_selecionado(topo):
+        return
+    if suite_completa_em_cache(local_sha, topo, base):
+        return
+    disparar_suite_completa(local_sha, base, topo)
+
+
+def _apagar_suite_fundo_se_minha(pid: int | None) -> None:
+    """Apaga suite-fundo.json se ainda registrar o pid dado."""
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    dados = _ler_json(base_dir() / "suite-fundo.json")
+    if dados and dados.get("pid") == pid:
+        try:
+            (base_dir() / "suite-fundo.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _apagar_suite_falhou() -> None:
+    """Apaga a falha pendente de suíte completa, se existir."""
+    try:
+        (base_dir() / "suite-falhou.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _gravar_suite_falhou(sha: str, base: str, relatorio: str) -> None:
+    """Registra a falha real da suíte completa (1 linha JSON).
+
+    `base` é a base usada pela suíte que falhou: o próximo push une os
+    arquivos desse intervalo aos do push próprio para não pular o check
+    que falhou (ver `_arquivos_com_falha`).
+    """
+    try:
+        pasta = base_dir()
+        pasta.mkdir(parents=True, exist_ok=True)
+        dados = {"sha": sha, "base": base,
+                 "relatorio": relatorio[:MAX_RELATORIO],
+                 "quando": agora_iso()}
+        (pasta / "suite-falhou.json").write_text(
+            json.dumps(dados, ensure_ascii=False) + "\n", encoding="utf-8")
+    except (OSError, RuntimeError) as exc:
+        log(f"suite-falhou não gravado: {exc}")
+
+
+def _arquivos_com_falha(sha: str, topo: str,
+                        arquivos: list[str]) -> list[str] | None:
+    """União dos arquivos do push com os da falha de suíte registrada.
+
+    A falha (`suite-falhou.json`) pode cobrir arquivos fora do diff do
+    push (base..sha): sem a união, o filtro de cobertura pularia o check
+    que falhou e o completo passaria em falso. O diff da falha é
+    `base_da_falha..sha`; base ausente/inválida usa o primeiro pai do sha
+    da falha; o diff falhando usa `sha_da_falha^..sha`; sem diff nenhum,
+    devolve None (rodar TODOS os checks, sem filtro de cobertura).
+    """
+    dados = _ler_json(base_dir() / "suite-falhou.json")
+    sha_falha = dados.get("sha") if isinstance(dados, dict) else None
+    if not isinstance(sha_falha, str) or not sha_falha:
+        return None
+    base_falha = dados.get("base") if isinstance(dados, dict) else None
+    if not isinstance(base_falha, str) or not base_falha:
+        try:
+            base_falha = pai1_ou_vazio(sha_falha)
+        except RuntimeError:
+            base_falha = None
+    intervalos: list[list[str]] = []
+    if base_falha:
+        intervalos.append([base_falha, sha])
+    intervalos.append([f"{sha_falha}^", sha])
+    for intervalo in intervalos:
+        p = git(["diff", "--name-only", *intervalo], cwd=topo)
+        if p.returncode == 0:
+            extras = [l.strip() for l in p.stdout.splitlines() if l.strip()]
+            return sorted(set(arquivos) | set(extras))
+    return None
+
+
+def _apagar_falha_ancestral(sha: str, topo: str) -> None:
+    """Apaga suite-falhou.json se a falha for de um ancestral de `sha`."""
+    caminho = base_dir() / "suite-falhou.json"
+    dados = _ler_json(caminho)
+    if not dados or not isinstance(dados.get("sha"), str):
+        return
+    if git(["merge-base", "--is-ancestor", dados["sha"], sha],
+           cwd=topo).returncode == 0:
+        try:
+            caminho.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def rodar_checks(sha: str, topo: str, base: str | None = None,
+                 forcar_completo: bool = False,
+                 abortar: Callable[[], bool] | None = None) -> tuple[bool, str]:
     """Roda os checks num worktree temporário de `sha`.
 
     A origem é a primeira não vazia: checks manuais de `revisor.check`
@@ -2268,7 +2552,14 @@ def rodar_checks(sha: str, topo: str,
     cache, devolve (True, "") sem criar worktree nem pegar o lock.
     Worktrees temporários são removidos; o persistente é mantido. Com
     `revisor.checkFinal=selecionado` e nenhum arquivo de build/config no
-    diff, delega para `_rodar_checks_selecionados`.
+    diff, delega para `_rodar_checks_selecionados`; `forcar_completo`
+    (suíte completa em fundo) ignora a seleção. Se `suite-falhou.json`
+    existe e a seleção está ligada, roda o completo — com os arquivos da
+    falha somados aos do push (`_arquivos_com_falha`) — e, passando E a
+    falha sendo ancestral de `sha`, apaga a falha registrada; falha em
+    outra linha de histórico é ignorada (log) sem forçar o completo.
+    `abortar` é repassado a `_executar_checks` (a suíte em fundo cede a
+    vez a um push).
     """
     if base is None:
         base = pai1_ou_vazio(sha)
@@ -2278,12 +2569,54 @@ def rodar_checks(sha: str, topo: str,
                            f"{p_diff.stderr.strip()[:300]}")
     arquivos = [linha.strip() for linha in p_diff.stdout.splitlines()
                 if linha.strip()]
-    if check_final_selecionado(topo):
+    caminho_falha = base_dir() / "suite-falhou.json"
+    selecionado = check_final_selecionado(topo) and not forcar_completo
+    falha_suite = False
+    if selecionado and caminho_falha.exists():
+        dados_falha = _ler_json(caminho_falha)
+        sha_falha = (dados_falha.get("sha")
+                     if isinstance(dados_falha, dict)
+                     and isinstance(dados_falha.get("sha"), str) else None)
+        ancestral = (isinstance(sha_falha, str)
+                     and git(["merge-base", "--is-ancestor", sha_falha, sha],
+                             cwd=topo).returncode == 0)
+        if ancestral:
+            log(f"check final: suíte completa falhou em {sha7(sha_falha)}; "
+                "rodando completo até ficar verde")
+            falha_suite = True
+        else:
+            log(f"suíte falhou em outra linha "
+                f"({sha7(sha_falha) if sha_falha else '?'}); ignorando")
+    if selecionado and not falha_suite:
         if any(_forca_completo(a) for a in arquivos):
             log("check final: arquivo de build/config alterado; "
                 "rodando completo")
         else:
             return _rodar_checks_selecionados(sha, topo, arquivos)
+    # caminho completo: a falha registrada pode cobrir arquivos fora do
+    # diff base..sha (vale também para a suíte em fundo forçada) — sem a
+    # união, o filtro de cobertura pularia o check que falhou
+    arquivos_check: list[str] | None = arquivos
+    if caminho_falha.exists():
+        arquivos_check = _arquivos_com_falha(sha, topo, arquivos)
+    ok, rel = _rodar_checks_completos(sha, topo, arquivos_check, abortar)
+    if ok and falha_suite:
+        _apagar_suite_falhou()
+    return ok, rel
+
+
+def _rodar_checks_completos(
+        sha: str, topo: str, arquivos: list[str] | None,
+        abortar: Callable[[], bool] | None = None) -> tuple[bool, str]:
+    """Caminho completo de `rodar_checks` (sem seleção de testes).
+
+    `arquivos` já vem do diff base..sha calculado por quem chama;
+    None desliga o filtro de cobertura (rodar TODOS os checks).
+    """
+
+    def _cobre(prefixo: str) -> bool:
+        return arquivos is None or _check_cobre(prefixo, arquivos)
+
     p = git(["config", "--get-all", "revisor.check"], cwd=topo)
     brutos = ([linha.strip() for linha in p.stdout.splitlines()
                if linha.strip()] if p.returncode == 0 else [])
@@ -2315,7 +2648,7 @@ def rodar_checks(sha: str, topo: str,
             log("checks pulados: " + "; ".join(vistos))
 
     if manuais:
-        filtrados = [c for c in manuais if _check_cobre(c[0], arquivos)]
+        filtrados = [c for c in manuais if _cobre(c[0])]
         if not filtrados:
             log("checks: nenhum cobre os arquivos alterados")
             return True, ""
@@ -2337,12 +2670,14 @@ def rodar_checks(sha: str, topo: str,
                     kwargs = ({"arvore": arvore, "topo": topo}
                               if arvore else {})
                     ok, rel = _executar_checks(filtrados, tmp, timeout_check,
-                                               pulos, estrito=True, **kwargs)
+                                               pulos, estrito=True,
+                                               abortar=abortar, **kwargs)
             _fechar_pulos(pulos)
             return ok, rel
     if not _auto_check_ativo(topo):
         return True, ""
-    if arvore and _deteccao_toda_em_cache(arvore, arquivos):
+    if arvore and arquivos is not None and _deteccao_toda_em_cache(
+            arvore, arquivos):
         log(f"checks: todos em cache para a árvore {arvore[:7]}")
         return True, ""
     with worktree_checks(sha, topo) as tmp:
@@ -2352,7 +2687,7 @@ def rodar_checks(sha: str, topo: str,
         # check final não pula: ferramenta ausente que cobre arquivo
         # alterado segura o push antes de rodar qualquer coisa
         for prefixo, motivo in ausentes:
-            if _check_cobre(prefixo, arquivos):
+            if _cobre(prefixo):
                 log(f"check final: {motivo}")
                 _fechar_pulos(pulos)
                 return False, f"{CHECK_SEM_FERRAMENTA}: {motivo}"
@@ -2361,7 +2696,7 @@ def rodar_checks(sha: str, topo: str,
             return True, ""
         checks = [(prefixo, lista, cwd_rel, False)
                   for prefixo, lista, cwd_rel in detectados]
-        filtrados = [c for c in checks if _check_cobre(c[0], arquivos)]
+        filtrados = [c for c in checks if _cobre(c[0])]
         if not filtrados:
             log("checks: nenhum cobre os arquivos alterados")
             _fechar_pulos(pulos)
@@ -3108,9 +3443,9 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
             print(f"revisor: {msg}")
             notificar("Push segurado", msg)
             return 1
-        msg = ("push segurado: os testes não puderam rodar agora; vou tentar "
-               "de novo sozinho assim que a máquina liberar "
-               "(git revisor status). Não precisa fazer nada.")
+        msg = (f"{MARCADOR_PUSH_SEGURADO}; vou tentar de novo sozinho assim "
+               "que a máquina liberar (git revisor status). Não precisa "
+               "fazer nada.")
         disparou = False
         if remote and remote_ref and local_ref:
             ref_ok = resolver_ref_local(local_ref, local_sha, topo)
@@ -3138,6 +3473,7 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
                 salvar_relatorio(sha, texto_regra)
                 limpar_inconclusivo(sha)
             print(f"revisor: push aprovado; {len(novos)} commit(s) aprovados por regra")
+            disparar_suite_fundo_se_preciso(novos, local_sha, topo, base)
             return 0
         ok_rapido, relatorio_rapido = rodar_checks_rapidos(local_sha, topo, base)
         if not ok_rapido:
@@ -3156,6 +3492,7 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
                 salvar_relatorio(sha, texto_regra)
                 limpar_inconclusivo(sha)
             print(f"revisor: push aprovado; {len(novos)} commit(s) aprovados por regra")
+            disparar_suite_fundo_se_preciso(novos, local_sha, topo, base)
             return 0
     # gitleaks acima cobre o intervalo inteiro; a IA vê só os pendentes
     veredito, saida, familias = revisar_diff(
@@ -3232,6 +3569,7 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
                 return 1
             print(f"revisor: push aprovado; {len(novos)} commit(s) revisados "
                   f"em {len(grupos)} grupo(s)")
+            disparar_suite_fundo_se_preciso(novos, local_sha, topo, base)
             return 0
     if veredito == "APROVADO" and ia_primeiro:
         ok_check, relatorio_check = rodar_checks(local_sha, topo, base=base)
@@ -3251,6 +3589,7 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
             marcar_aprovado(sha, resumo, familia=familia)
             limpar_inconclusivo(sha)  # ex.: revisão adiada pelo próprio push
         print(f"revisor: push aprovado; {len(novos)} commit(s) revisados")
+        disparar_suite_fundo_se_preciso(novos, local_sha, topo, base)
         return 0
     if veredito == "REPROVADO":
         for sha in novos:
@@ -4446,6 +4785,38 @@ def linhas_retentar() -> list[str]:
     return linhas
 
 
+def linhas_suite_fundo() -> list[str]:
+    """Linha da suíte completa em fundo, se houver (sha e pid vivo/morto)."""
+    try:
+        dados = _ler_json(base_dir() / "suite-fundo.json")
+    except Exception:
+        return []
+    if not dados or not isinstance(dados.get("sha"), str):
+        return []
+    estado = ""
+    pid = dados.get("pid")
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+            estado = f" (pid {pid} vivo)"
+        except OSError:
+            estado = f" (pid {pid} morto)"
+    return [f"suíte completa: {sha7(dados['sha'])}{estado}"]
+
+
+def linha_suite_falhou() -> str | None:
+    """Linha da falha de suíte completa pendente, se houver."""
+    try:
+        dados = _ler_json(base_dir() / "suite-falhou.json")
+    except Exception:
+        return None
+    if not dados or not isinstance(dados.get("sha"), str):
+        return None
+    relatorio = dados.get("relatorio")
+    primeira = primeira_linha(relatorio) if isinstance(relatorio, str) else "?"
+    return f"suíte completa falhou em {sha7(dados['sha'])}: {primeira}"
+
+
 def cmd_status(sha_curto: str | None) -> int:
     """Subcomando status: resumo dos commits e do log, ou relatório de um sha."""
     if sha_curto:
@@ -4462,6 +4833,15 @@ def cmd_status(sha_curto: str | None) -> int:
         print("--- retentativas de push pendentes ---")
         for linha in retentar:
             print(linha)
+    suite = linhas_suite_fundo()
+    if suite:
+        print("--- suíte completa em fundo ---")
+        for linha in suite:
+            print(linha)
+    falha_suite = linha_suite_falhou()
+    if falha_suite:
+        print("--- falha de suíte completa pendente ---")
+        print(falha_suite)
     print("--- checks configurados ---")
     for linha in linhas_checks():
         print(linha)
@@ -4614,8 +4994,11 @@ def cmd_retentar_push(sha_curto: str) -> int:
     memória ≥ `revisor.memMinimaMb`, lock de checks livre e nenhum push
     esperando. Se a branch local (`local_ref`) não aponta mais para o sha,
     desiste sem push: o próximo push cobre. Roda `git push <remote>
-    <local_ref>:<remote_ref>` (timeout de 3 h) e notifica o resultado. Sempre
-    apaga o pedido ao final.
+    <local_ref>:<remote_ref>` (timeout de 3 h) e notifica o resultado. Se o
+    push for segurado DE NOVO pelo hook (marcador retentável), volta ao
+    laço de espera dentro do mesmo prazo, sem notificar erro; só falha que
+    não seja segurado-retentável (reprovação real, erro de rede) notifica
+    "Push ainda bloqueado". Sempre apaga o pedido ao final.
     """
     sha = sha_completo(sha_curto)
     caminho = base_dir() / "retentar-push" / f"{sha}.json"
@@ -4653,34 +5036,105 @@ def cmd_retentar_push(sha_curto: str) -> int:
             if ((mb is None or mb >= mem_minima_mb())
                     and not lock_checks_ocupado()
                     and not push_esperando()):
-                break
+                try:
+                    p = git(["push", remote, f"{local_ref}:{remote_ref}"],
+                            cwd=topo, timeout=3 * 3600)
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    notificar("Push ainda bloqueado",
+                              f"Push ainda bloqueado: {exc}"[:500])
+                    return 1
+                if p.returncode == 0:
+                    notificar("Push enviado",
+                              f"{sha7(sha)} enviado para {remote} ({local_ref})")
+                    return 0
+                fim_txt = p.stderr.strip() or p.stdout.strip() or "sem detalhes"
+                if MARCADOR_PUSH_SEGURADO in fim_txt:
+                    # o hook segurou a retentativa DE NOVO (lock/infra):
+                    # voltar a esperar dentro do mesmo prazo, sem erro
+                    log("retentar-push: segurado de novo; "
+                        "esperando a máquina liberar")
+                    continue
+                ultimas = "\n".join(fim_txt.splitlines()[-5:])
+                notificar("Push ainda bloqueado",
+                          f"Push ainda bloqueado: {ultimas}"[:500])
+                return 1
             if time.monotonic() >= fim:
                 notificar("Push segue segurado",
                           f"{sha7(sha)}: a máquina não liberou em {horas:g} h; "
                           "rode git push de novo quando puder")
                 return 1
             time.sleep(60)
-        try:
-            p = git(["push", remote, f"{local_ref}:{remote_ref}"],
-                    cwd=topo, timeout=3 * 3600)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            notificar("Push ainda bloqueado",
-                      f"Push ainda bloqueado: {exc}"[:500])
-            return 1
-        if p.returncode == 0:
-            notificar("Push enviado",
-                      f"{sha7(sha)} enviado para {remote} ({local_ref})")
-            return 0
-        fim_txt = p.stderr.strip() or p.stdout.strip() or "sem detalhes"
-        ultimas = "\n".join(fim_txt.splitlines()[-5:])
-        notificar("Push ainda bloqueado",
-                  f"Push ainda bloqueado: {ultimas}"[:500])
-        return 1
     finally:
         try:
             caminho.unlink()
         except OSError:
             pass
+
+
+def cmd_suite_completa(sha_curto: str) -> int:
+    """Subcomando suite-completa: suíte COMPLETA da árvore em segundo plano.
+
+    Espera (como retentar-push) memória ≥ `revisor.memMinimaMb`, nenhum
+    push esperando e o lock de checks livre, até `revisor.retentarMaxH`
+    horas. Roda os checks completos (nunca selecionados) com
+    `rodar_checks(..., forcar_completo=True)`, cedendo a vez a um push
+    que aparecer (`abortar=push_esperando`): infra/ocupado/cedido volta a
+    esperar dentro do prazo; esgotou, notifica sem marcar falha.
+    Ferramenta ausente notifica e encerra sem marcar falha (o push já
+    teria bloqueado por isso). Falha real grava `suite-falhou.json` e
+    notifica — o próximo push roda o completo até ficar verde. Verde
+    apaga falha registrada de sha ancestral. Sempre apaga
+    `suite-fundo.json` se ainda for o dele (mesmo pid).
+    """
+    sha = sha_completo(sha_curto)
+    topo = toplevel()
+    caminho = base_dir() / "suite-fundo.json"
+    dados = _ler_json(caminho)
+    pid_proprio = dados.get("pid") if dados else None
+    base = dados.get("base") if dados else None
+    if not isinstance(base, str) or not base:
+        base = pai1_ou_vazio(sha)
+    try:
+        horas = float(cfg("retentarMaxH", "6"))
+    except ValueError:
+        horas = 6.0
+    if horas <= 0:
+        horas = 6.0
+    fim = time.monotonic() + horas * 3600
+    try:
+        while True:
+            if time.monotonic() >= fim:
+                notificar("Suíte completa não rodou",
+                          f"{sha7(sha)}: a máquina não liberou em "
+                          f"{horas:g} h")
+                return 1
+            mb = mem_disponivel_mb()
+            if not ((mb is None or mb >= mem_minima_mb())
+                    and not lock_checks_ocupado()
+                    and not push_esperando()):
+                time.sleep(60)
+                continue
+            ok, rel = rodar_checks(sha, topo, base=base,
+                                   forcar_completo=True,
+                                   abortar=push_esperando)
+            if ok:
+                log(f"suíte completa verde em {sha7(sha)}")
+                _apagar_falha_ancestral(sha, topo)
+                return 0
+            if check_sem_ferramenta(rel):
+                notificar("Suíte completa não rodou", rel.strip()[:300])
+                return 0
+            if check_ocupado(rel):
+                log(f"suíte completa: {rel.strip()[:200]}; "
+                    "voltando a esperar")
+                continue
+            _gravar_suite_falhou(sha, base, rel)
+            notificar("Suíte completa falhou",
+                      f"{sha7(sha)}: {primeira_linha(rel)}; o próximo push "
+                      "roda a suíte completa e só passa com ela verde")
+            return 1
+    finally:
+        _apagar_suite_fundo_se_minha(pid_proprio)
 
 
 def cmd_limpar() -> int:
@@ -4773,6 +5227,8 @@ def despachar(sub: str, args: list[str]) -> int:
         return cmd_corrigir_push(args[0])
     if sub == "retentar-push" and len(args) == 1:
         return cmd_retentar_push(args[0])
+    if sub == "suite-completa" and len(args) == 1:
+        return cmd_suite_completa(args[0])
     if sub == "pendentes" and not args:
         return cmd_pendentes()
     if sub == "status" and len(args) <= 1:
