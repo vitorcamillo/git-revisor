@@ -637,6 +637,40 @@ def test_retentar_push_segurado_de_novo_volta_a_esperar(
     assert not pedido.exists()
 
 
+def test_retentar_push_segurado_de_novo_marcador_no_stdout(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Marcador no stdout (git < 2.36 manda a saída do pre-push para lá)
+    com a recusa no stderr: segurado de novo, não 'ainda bloqueado'."""
+    _commit(repo, {"a.txt": "1\n"}, "feat: a")
+    _git(repo, "checkout", "-q", "-b", "main")
+    sha = _commit(repo, {"a.txt": "2\n"}, "feat: v1")
+    pedido = mod.base_dir() / "retentar-push" / f"{sha}.json"
+    _escrever_json(pedido,
+                   {"remote": "origem", "remote_ref": "refs/heads/main",
+                    "local_ref": "refs/heads/main",
+                    "quando": mod.agora_iso()})
+    marcador = mod.MARCADOR_PUSH_SEGURADO
+    resultados = [_Proc(1, f"revisor: {marcador}\n",
+                        "error: failed to push some refs"),
+                  _Proc(0, "", "")]
+    chamadas: list[list[str]] = []
+    _gravar_git_push(monkeypatch, resultados, chamadas)
+    _condicoes_livres(monkeypatch)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    avisos: list[tuple[str, str]] = []
+    monkeypatch.setattr(mod, "notificar",
+                        lambda titulo, msg: avisos.append((titulo, msg)))
+    logs: list[str] = []
+    monkeypatch.setattr(mod, "log", logs.append)
+    rc = mod.cmd_retentar_push(sha)
+    assert rc == 0
+    pushes = [c for c in chamadas if c and c[0] == "push"]
+    assert len(pushes) == 2
+    assert [t for t, _m in avisos].count("Push enviado") == 1
+    assert all(t != "Push ainda bloqueado" for t, _m in avisos)
+    assert any("segurado de novo" in l for l in logs)
+
+
 def test_retentar_push_segurado_sempre_esgota_teto(
         repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Segurado em toda tentativa: para no teto (sem laço infinito), com

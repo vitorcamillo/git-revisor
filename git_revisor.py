@@ -3375,7 +3375,11 @@ def disparar_retentar_push(local_sha: str, remote: str, remote_ref: str,
     original. Se já houver pedido com processo vivo, não dispara de novo.
     """
     pasta = base_dir() / "retentar-push"
-    pasta.mkdir(parents=True, exist_ok=True)
+    try:
+        pasta.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log(f"retantar-push: não consegui criar {pasta}: {exc}")
+        return False
     caminho = pasta / f"{local_sha}.json"
     dados_exist = _ler_json(caminho)
     if dados_exist:
@@ -5116,7 +5120,10 @@ def cmd_retentar_push(sha_curto: str) -> int:
                     notificar("Push enviado",
                               f"{sha7(sha)} enviado para {remote} ({local_ref})")
                     return 0
-                fim_txt = p.stderr.strip() or p.stdout.strip() or "sem detalhes"
+                # git < 2.36 manda a saída do pre-push para o stdout; a
+                # recusa ("failed to push some refs") vai ao stderr:
+                # procurar o marcador na junção dos dois
+                fim_txt = (p.stdout + "\n" + p.stderr).strip() or "sem detalhes"
                 if MARCADOR_PUSH_SEGURADO in fim_txt:
                     # o hook segurou a retentativa DE NOVO (lock/infra):
                     # esperar e voltar, dentro do mesmo prazo e até o teto
