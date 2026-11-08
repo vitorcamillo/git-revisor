@@ -126,9 +126,9 @@ def test_lock_persistente_ocupado_usa_temporario(
     caminhos: list[Path] = []
     executar = mod._executar_checks
 
-    def _capturar(checks, tmp, timeout_check, pulos=None):
+    def _capturar(checks, tmp, timeout_check, pulos=None, **kwargs):
         caminhos.append(Path(tmp))
-        return executar(checks, tmp, timeout_check, pulos)
+        return executar(checks, tmp, timeout_check, pulos, **kwargs)
 
     monkeypatch.setattr(mod, "_executar_checks", _capturar)
     lock = mod.pasta_cache_repo() / "wt.lock"

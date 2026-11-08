@@ -1911,23 +1911,23 @@ def test_custo_chamar_e_resumo(repo, monkeypatch):
     assert "1 revisões" in resumo and "1 workers" in resumo
 
 
-def test_checks_pulados_uma_linha(repo, monkeypatch):
-    """Dois pulos iguais viram uma única linha checks pulados: sem repetição."""
+def test_check_final_comando_inexistente_segura(repo, monkeypatch):
+    """Check final não pula comando inexistente: segura SEM_FERRAMENTA."""
     sha = commit_arquivo(repo, "app.py", "x = 1\n", "feat")
     monkeypatch.setattr(gr, "_auto_check_ativo", lambda _topo: True)
     monkeypatch.setattr(
         gr, "detectar_checks",
-        lambda _tmp, _topo, pulos=None: [("", ["cmd-inexistente-xyz"], ""),
+        lambda _tmp, _topo, pulos=None, ausentes=None: [("", ["cmd-inexistente-xyz"], ""),
                                          ("", ["cmd-inexistente-xyz"], "")])
     base = gr.base_dir()
     base.mkdir(parents=True, exist_ok=True)
     (base / "log.txt").write_text("", encoding="utf-8")
-    ok, _ = gr.rodar_checks(sha, str(repo))
-    assert ok is True
+    ok, relatorio = gr.rodar_checks(sha, str(repo))
+    assert ok is False
+    assert relatorio.startswith(gr.CHECK_SEM_FERRAMENTA)
+    assert "cmd-inexistente-xyz" in relatorio
     texto = (base / "log.txt").read_text(encoding="utf-8")
-    linhas = [l for l in texto.splitlines() if "checks pulados:" in l]
-    assert len(linhas) == 1
-    assert linhas[0].count("cmd-inexistente-xyz") == 1
+    assert "checks pulados:" not in texto
 
 
 # ==================== push em fundo, retomada e worktrees órfãos ====================

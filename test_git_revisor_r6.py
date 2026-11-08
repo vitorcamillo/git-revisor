@@ -145,12 +145,15 @@ def test_intervalo_risco_baixo_ocupado_bloqueia_sem_salvar(
         ia=_proibido("revisar_diff"),
         risco=("baixo", []))
     sha = _commit(repo, {"app.py": "x = 1\n"}, "feat: app")
+    monkeypatch.setattr(mod, "disparar_retentar_push",
+                        _proibido("disparar_retentar_push"))
     assert mod.revisar_intervalo([sha], sha, str(repo)) == 1
     assert not mod.esta_aprovado(sha)
     assert caminhos == []
     assert mod.ler_relatorio(sha) is None
     saida = capsys.readouterr().out
-    assert "revisor: " in saida and "REVISOR_PULAR=1 git push" in saida
+    assert ("push segurado: os testes não puderam rodar agora" in saida
+            and "vou tentar de novo sozinho" in saida)
 
 
 def test_intervalo_pos_ia_ocupado_bloqueia_sem_salvar(
@@ -165,12 +168,15 @@ def test_intervalo_pos_ia_ocupado_bloqueia_sem_salvar(
         rapido=_gravadora(chamadas, "rapido", (True, "")),
         ia=_gravadora(chamadas, "IA", ("APROVADO", "tudo certo", {"codex"})))
     sha = _commit(repo, {"app.py": "x = 1\n"}, "feat: app")
+    monkeypatch.setattr(mod, "disparar_retentar_push",
+                        _proibido("disparar_retentar_push"))
     assert mod.revisar_intervalo([sha], sha, str(repo)) == 1
     assert not mod.esta_aprovado(sha)
     assert caminhos == []
     assert mod.ler_relatorio(sha) is None
     saida = capsys.readouterr().out
-    assert "revisor: " in saida and "REVISOR_PULAR=1 git push" in saida
+    assert ("push segurado: os testes não puderam rodar agora" in saida
+            and "vou tentar de novo sozinho" in saida)
 
 
 # ---------------------------------------------------------- revisar_com_trava

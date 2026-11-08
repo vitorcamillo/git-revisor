@@ -153,7 +153,8 @@ def test_auto_segunda_na_mesma_arvore_pula_deteccao(
     chamadas_deteccao: list[int] = []
 
     def _deteccao_falsa(_tmp: str, _topo: str,
-                        pulos: list[str] | None = None
+                        pulos: list[str] | None = None,
+                        ausentes: list[str] | None = None
                         ) -> list[tuple[str, list[str], str]]:
         chamadas_deteccao.append(1)
         return [("", ["python3", "-c", _codigo_contador(contador)], "")]
@@ -187,7 +188,7 @@ def test_deteccao_em_cache_depende_da_base(
               for pasta in ("a", "b")]
     monkeypatch.setattr(mod, "_auto_check_ativo", lambda _topo: True)
     monkeypatch.setattr(mod, "detectar_checks",
-                        lambda _tmp, _topo, _pulos=None: checks)
+                        lambda _tmp, _topo, _pulos=None, _ausentes=None: checks)
 
     inicial = _commit(repo, {"a/x": "a0\n", "b/y": "b0\n"}, "base")
     base_a = _commit(repo, {"b/y": "b1\n"}, "base a")

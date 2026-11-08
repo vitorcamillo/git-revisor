@@ -1,8 +1,11 @@
 """Testes R9: convergência do push gate em lotes grandes.
 
-Divergência mensagem↔diff vira BAIXA (não reprovável), prompts de revisão
-por partes avisam que são só uma parte, e correção vazia/ausente não manda
-o usuário empurrar de novo.
+Prompts de revisão por partes avisam que são só uma parte, e correção
+vazia/ausente não manda o usuário empurrar de novo. A regra de intenção
+original da R9 (divergência mensagem↔diff BAIXA) foi substituída pela
+R12: divergência é MEDIA, com errata (`.revisor/errata.md`) como caminho
+de resolução — os testes da regra vivem em test_git_revisor_r12.py e
+aqui afirmam a regra nova.
 """
 from __future__ import annotations
 
@@ -20,13 +23,16 @@ _spec.loader.exec_module(mod)
 
 # ------------------------------------------------------------ montar_prompt
 
-def test_montar_prompt_intencao_divergencia_e_baixa() -> None:
-    """Regra de intenção nova: divergência é BAIXA, sem o MEDIA antigo."""
+def test_montar_prompt_intencao_divergencia_e_media() -> None:
+    """Regra de intenção (R12): divergência é MEDIA, com errata."""
     prompt = mod.montar_prompt("DIFFXYZ", "repo", "abc1234",
                                intencao="feat: faz algo")
-    assert "BAIXA" in prompt
-    assert "descumprimento é problema MEDIA" not in prompt
-    assert "mensagem de um commit já feito não é corrigível" in prompt
+    assert "é problema MEDIA" in prompt
+    assert "problema BAIXA" not in prompt
+    assert "não reprove por isso" not in prompt
+    assert "mensagem de um commit já feito não é corrigível" not in prompt
+    assert "errata" in prompt
+    assert "nunca justifica bug" in prompt
     assert "Mensagem vaga não é problema" in prompt
 
 
@@ -34,8 +40,8 @@ def test_montar_prompt_intencao_seguranca_continua_alta() -> None:
     """Exceção de segurança segue ALTA na regra de divergência."""
     prompt = mod.montar_prompt("DIFFXYZ", "repo", "abc1234",
                                intencao="feat: faz algo")
-    assert "mudança de segurança" in prompt
-    assert "é ALTA" in prompt
+    assert "envolver segurança" in prompt
+    assert "ALTA" in prompt
 
 
 def test_montar_prompt_multipartes_frase_condicional() -> None:

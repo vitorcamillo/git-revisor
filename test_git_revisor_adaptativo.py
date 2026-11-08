@@ -181,13 +181,18 @@ def test_rodar_checks_comando_falha(repo: Path,
     assert len(listagem) == 1
 
 
-def test_rodar_checks_exit_75_pula(repo: Path,
-                                   monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exit 75 (ferramenta indisponível) não reprova."""
+def test_rodar_checks_exit_75_segura(repo: Path,
+                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exit 75 no check final: espera memória, repete e segue SEM_RECURSO."""
     _sem_ferramentas(monkeypatch)
+    monkeypatch.setattr(mod, "esperar_memoria", lambda *_a, **_k: True)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_a: None)
     sha = _commit(repo, {"app.py": "x = 1\n"}, "feat: app")
     _git(repo, "config", "--add", "revisor.check", "sh -c 'exit 75'")
-    assert mod.rodar_checks(sha, str(repo)) == (True, "")
+    ok, relatorio = mod.rodar_checks(sha, str(repo))
+    assert ok is False
+    assert relatorio.startswith(mod.CHECK_SEM_RECURSO)
+    assert "exit 75" in relatorio
 
 
 def _subprocess_falso(monkeypatch: pytest.MonkeyPatch, retorno: int = 0,
@@ -328,19 +333,22 @@ def test_pulo_pytest_exit_5(repo: Path,
     assert mod.rodar_checks(sha, str(repo)) == (True, "")
 
 
-def test_pulo_comando_inexistente(repo: Path,
-                                  monkeypatch: pytest.MonkeyPatch) -> None:
-    """Comando não encontrado pula sem reprovar."""
+def test_segura_comando_inexistente(repo: Path,
+                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """Comando não encontrado no check final: SEM_FERRAMENTA, sem pular."""
     _sem_ferramentas(monkeypatch)
     sha = _commit(repo, {"app.py": "x = 1\n"}, "feat: app")
     _git(repo, "config", "--add", "revisor.check",
          "comando-que-nao-existe-xyz --help")
-    assert mod.rodar_checks(sha, str(repo)) == (True, "")
+    ok, relatorio = mod.rodar_checks(sha, str(repo))
+    assert ok is False
+    assert relatorio.startswith(mod.CHECK_SEM_FERRAMENTA)
+    assert "comando-que-nao-existe-xyz" in relatorio
 
 
-def test_pulo_detectado_cannot_find_module(
+def test_segura_detectado_cannot_find_module(
         repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Check detectado com Cannot find module e exit 1 pula."""
+    """Check detectado com Cannot find module no final: SEM_FERRAMENTA."""
     _sem_ferramentas(monkeypatch)
     sha = _commit(repo, {"web/x.js": "console.log(1)\n"}, "feat: web")
     detectados = [("web", ["node", "app.js"], "web")]
@@ -348,7 +356,10 @@ def test_pulo_detectado_cannot_find_module(
                         lambda *_a, **_k: detectados)
     _subprocess_falso(monkeypatch, retorno=1,
                       stderr="Error: Cannot find module 'foo'\n")
-    assert mod.rodar_checks(sha, str(repo)) == (True, "")
+    ok, relatorio = mod.rodar_checks(sha, str(repo))
+    assert ok is False
+    assert relatorio.startswith(mod.CHECK_SEM_FERRAMENTA)
+    assert "Cannot find module" in relatorio
 
 
 def test_manual_cannot_find_module_reprova(
