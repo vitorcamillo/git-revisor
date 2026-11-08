@@ -1027,7 +1027,8 @@ def montar_prompt(diff_texto: str, repo: str, commits: str,
                   risco_alto: list[str] | None = None,
                   intencao: str | None = None,
                   evidencia: str | None = None,
-                  contexto_repo: str | None = None) -> str:
+                  contexto_repo: str | None = None,
+                  multipartes: bool = False) -> str:
     """Monta o prompt do revisor com tetos em bytes UTF-8.
 
     O prompt viaja como UM argumento de linha de comando e o Linux limita cada
@@ -1035,6 +1036,8 @@ def montar_prompt(diff_texto: str, repo: str, commits: str,
     parte de diff já entra com ≤ MAX_DIFF_BYTES (ver dividir_em_partes); se
     mesmo assim o prompt estourar, falha — nunca se revisa texto cortado.
     'contexto' traz commits do mesmo push já aprovados, como histórico (o diff é base..ponta).
+    'multipartes' indica que o diff revisado é só uma parte de um todo maior
+    (revisar_por_partes), o que afrouxa a verificação de intenção.
     """
     partes = [
         "Você é o revisor automático de commits. Revise o diff abaixo procurando: bugs, "
@@ -1071,8 +1074,19 @@ def montar_prompt(diff_texto: str, repo: str, commits: str,
         partes.append("O que o commit diz que faz (mensagem completa):\n"
                       + texto_intencao)
         partes.append("Verifique também se o diff cumpre o que a mensagem diz "
-                      "que faz e nada além; descumprimento é problema MEDIA "
-                      "(ALTA se envolver segurança). Mensagem vaga não é problema.")
+                      "que faz. Divergência entre mensagem e diff (prometer "
+                      "algo que não aparece, ou fazer algo não mencionado) é "
+                      "problema BAIXA: registre, mas não reprove por isso — a "
+                      "mensagem de um commit já feito não é corrigível pela "
+                      "correção automática. Exceção: se a divergência esconder "
+                      "mudança de segurança (auth, permissão, segredo, "
+                      "pagamento), é ALTA. Mensagem vaga não é problema.")
+        if multipartes:
+            partes.append("Esta é só uma parte do diff: algo prometido na "
+                          "mensagem que não aparece aqui pode estar em outra "
+                          "parte; isso não é problema. Use INTENCAO: "
+                          "NAO_VERIFICAVEL quando a parte não permitir "
+                          "verificar.")
     if evidencia:
         texto_evidencia = (evidencia.encode("utf-8")[:MAX_EVIDENCIA]
                            .decode("utf-8", "ignore"))
@@ -2279,7 +2293,8 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
             "com o VEREDITO; não espere as outras partes.",
             contexto, risco_alto=risco_alto,
             intencao=intencao, evidencia=evidencia,
-            contexto_repo=contexto_repo)
+            contexto_repo=contexto_repo,
+            multipartes=total > 1)
         for i in pendentes
     }
     autorreferida = set(MESMO_MODELO) | {"desconhecido"}
@@ -3358,7 +3373,10 @@ def tentativa_correcao(sha_original: str, sha_atual: str, relatorio: str,
             novo = commitar_correcao(tmp, sha_original, familia)
             if not novo:
                 notificar("Correção vazia",
-                          f"worker não alterou nada em {sha7(sha_original)}")
+                          f"corretor não alterou nada em {sha7(sha_original)}: "
+                          "os achados pedem decisão humana (ajuste o código ou "
+                          "reescreva a mensagem do commit); "
+                          "veja git revisor status")
                 return None
             return novo, familia
         finally:
@@ -3401,6 +3419,23 @@ def retomar_tentativa(sha_original: str, topo: str) -> str | None:
 def apagar_tentativa(sha_original: str, topo: str) -> None:
     """Apaga a ref oculta da tentativa, ignorando erro."""
     git(["update-ref", "-d", ref_tentativa(sha_original)], cwd=topo)
+
+
+def mensagem_pos_correcao(sha: str, topo: str) -> tuple[str, str]:
+    """Título e corpo da notificação quando a correção não virou push.
+
+    Com correção guardada na ref da tentativa, instrui novo push; sem ref
+    (correção vazia ou falhou), deixa claro que não há correção e que o
+    problema pede decisão humana — não manda empurrar de novo sem mudança.
+    """
+    if git(["rev-parse", "-q", "--verify", ref_tentativa(sha)],
+           cwd=topo).returncode == 0:
+        return ("Correção pendente",
+                f"correção guardada em {ref_tentativa(sha)}; "
+                "rode git push de novo")
+    return ("Reprovado sem correção",
+            f"{sha7(sha)} segue reprovado e não há correção guardada; "
+            "veja git revisor status")
 
 
 def reaplicar_sobre_head(sha_original: str, novo: str, topo: str) -> str | None:
@@ -4148,9 +4183,7 @@ def cmd_corrigir_push(sha_curto: str) -> int:
                     notificar("Envio falhou",
                               f"falha ao enviar correção de {sha7(sha)}: {curto}")
                 return rc
-            notificar("Correção pendente",
-                      f"correção guardada em {ref_tentativa(sha)}; "
-                      "rode git push de novo")
+            notificar(*mensagem_pos_correcao(sha, topo))
             return rc
     finally:
         try:
