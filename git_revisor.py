@@ -57,8 +57,11 @@ Check final selecionado: `revisor.checkFinal` escolhe entre `completo`
 o commit) usa a mesma seleção de testes do check rápido: cada check
 aplicável ao diff roda só os testes correspondentes aos arquivos
 alterados, e o check sem seleção possível roda inteiro (nunca é
-descartado). Alteração em arquivo de build/config (`pom.xml`,
-`pyproject.toml`, `package.json`, locks, etc.) força o check completo.
+descartado). Seleção que degradou para comando sem teste nenhum
+(`test-compile` do Maven ou `compileall` do pytest) também roda o
+comando original completo quando o diff toca código; alteração em
+arquivo de build/config (`pom.xml`, `pyproject.toml`, `package.json`,
+locks, etc.) força o check completo.
 """
 from __future__ import annotations
 
@@ -1843,6 +1846,35 @@ def _forca_completo(arquivo: str) -> bool:
                for glob in ARQUIVOS_FORCAM_COMPLETO)
 
 
+def _selecao_degradada(cmd: list[str]) -> bool:
+    """True se a seleção virou comando que não roda teste nenhum.
+
+    É o caso do `test-compile` do Maven (sem padrão útil ou com mais de
+    30 padrões) e do `compileall` do pytest (código .py alterado sem
+    teste correspondente).
+    """
+    if "test-compile" in cmd:
+        return True
+    return any(arg == "-m" and prox == "compileall"
+               for arg, prox in zip(cmd, cmd[1:]))
+
+
+def _toca_codigo(prefixo: str, arquivos: list[str]) -> bool:
+    """True se algum alterado sob o prefixo (`""` = todos) é código.
+
+    Considera código `.java`, `.kt` e `.py`, além de qualquer arquivo
+    dentro de uma pasta `src` (`src/...` ou `.../src/...`); inclui
+    arquivos apagados.
+    """
+    for a in arquivos:
+        if prefixo and not a.startswith(prefixo + "/"):
+            continue
+        if (a.endswith((".java", ".kt", ".py"))
+                or a.startswith("src/") or "/src/" in a):
+            return True
+    return False
+
+
 def _rodar_checks_selecionados(sha: str, topo: str,
                                arquivos: list[str]) -> tuple[bool, str]:
     """Check final com seleção de testes (`revisor.checkFinal=selecionado`).
@@ -1851,7 +1883,11 @@ def _rodar_checks_selecionados(sha: str, topo: str,
     senão detectados por `detectar_checks` com `revisor.autoCheck`; ignora
     `revisor.checkRapidoCmd`), filtrados por `_check_cobre`. Cada check
     passa por `selecionar_teste_rapido`; sem seleção possível, roda o
-    comando original completo (o check nunca é descartado). Mesmo
+    comando original completo (o check nunca é descartado). Seleção
+    degradada para comando sem teste (`test-compile` ou `compileall`)
+    também volta ao comando original completo quando o diff toca código
+    sob a pasta do check; sem código (só docs, por exemplo), mantém a
+    seleção. Mesmo
     worktree, lock, espera de `TEMPO_ESPERA_CHECK`, timeout e cache por
     árvore do check completo; os logs de execução usam o prefixo
     `check-selecionado`. Ignora `revisor.checkRapido`.
@@ -1908,6 +1944,11 @@ def _rodar_checks_selecionados(sha: str, topo: str,
             selecionado = selecionar_teste_rapido(prefixo, lista, existentes,
                                                   raiz=tmp)
             efetivo = selecionado if selecionado is not None else lista
+            if (selecionado is not None and _selecao_degradada(selecionado)
+                    and _toca_codigo(prefixo, arquivos)):
+                log(f"check final: seleção sem testes para {prefixo or '.'}; "
+                    "rodando completo")
+                efetivo = lista
             comandos.append((prefixo, efetivo, cwd_rel, eh_manual))
         with trava(TEMPO_ESPERA_CHECK,
                    arquivo=arquivo_trava_checks()) as livre:

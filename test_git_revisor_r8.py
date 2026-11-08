@@ -179,6 +179,104 @@ def test_falha_do_check_selecionado_reprova(
     assert any("check-selecionado" in l for l in logs)
 
 
+def test_selecionado_pytest_com_teste_correspondente_nao_degrada(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`selecionado` com seleção útil e código alterado: mantém a seleção."""
+    _git(repo, "config", "revisor.check", "@ /usr/bin/python3 -m pytest -q")
+    _git(repo, "config", "revisor.checkFinal", "selecionado")
+    _commit(repo, {"x.py": "x = 1\n",
+                   "tests/test_x.py": "def test_a():\n    assert True\n"},
+            "feat: base")
+    sha = _commit(repo, {"x.py": "x = 2\n",
+                         "tests/test_x.py": "def test_b():\n    assert True\n"},
+                  "feat: x e teste b")
+    estado = _capturar_execucao(monkeypatch)
+    ok, rel = mod.rodar_checks(sha, str(repo))
+    assert ok is True and rel == ""
+    assert [c[1] for c in estado["checks"]] == [
+        ["/usr/bin/python3", "-m", "pytest", "-q", "tests/test_x.py"]]
+    assert estado["rotulo"] == "check-selecionado"
+
+
+# ------------------------------------------- seleção degradada no final
+
+
+def test_selecionado_maven_mais_de_30_padroes_roda_completo(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Maven com >30 padrões degrada; com código alterado, roda completo."""
+    _git(repo, "config", "revisor.check", "@ mvn -B -q test")
+    _git(repo, "config", "revisor.checkFinal", "selecionado")
+    _commit(repo, {"docs/a.md": "base\n"}, "docs: base")
+    classes = {f"src/main/java/app/C{i}.java": f"class C{i} {{}}\n"
+               for i in range(31)}
+    sha = _commit(repo, classes, "feat: 31 classes")
+    logs: list[str] = []
+    monkeypatch.setattr(mod, "log", logs.append)
+    estado = _capturar_execucao(monkeypatch)
+    ok, rel = mod.rodar_checks(sha, str(repo))
+    assert ok is True and rel == ""
+    assert [c[1] for c in estado["checks"]] == [["mvn", "-B", "-q", "test"]]
+    assert estado["rotulo"] == "check-selecionado"
+    assert any("seleção sem testes para .; rodando completo" in l
+               for l in logs)
+
+
+def test_selecionado_maven_so_docs_mantem_degradado(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Maven com só docs alterado: mantém o `test-compile` degradado."""
+    _git(repo, "config", "revisor.check", "@ mvn -B -q test")
+    _git(repo, "config", "revisor.checkFinal", "selecionado")
+    _commit(repo, {"docs/x.md": "v1\n"}, "docs: v1")
+    sha = _commit(repo, {"docs/x.md": "v2\n"}, "docs: v2")
+    logs: list[str] = []
+    monkeypatch.setattr(mod, "log", logs.append)
+    estado = _capturar_execucao(monkeypatch)
+    ok, rel = mod.rodar_checks(sha, str(repo))
+    assert ok is True and rel == ""
+    assert [c[1] for c in estado["checks"]] == [
+        ["mvn", "-B", "-q", "test-compile"]]
+    assert estado["rotulo"] == "check-selecionado"
+    assert not any("seleção sem testes" in l for l in logs)
+
+
+def test_selecionado_pytest_modulo_sem_teste_roda_completo(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """pytest com módulo sem teste correspondente degrada; roda completo."""
+    _git(repo, "config", "revisor.check", "@ /usr/bin/python3 -m pytest -q")
+    _git(repo, "config", "revisor.checkFinal", "selecionado")
+    _commit(repo, {"pkg/__init__.py": ""}, "feat: base")
+    sha = _commit(repo, {"pkg/modulo.py": "y = 2\n"}, "feat: modulo")
+    logs: list[str] = []
+    monkeypatch.setattr(mod, "log", logs.append)
+    estado = _capturar_execucao(monkeypatch)
+    ok, rel = mod.rodar_checks(sha, str(repo))
+    assert ok is True and rel == ""
+    assert [c[1] for c in estado["checks"]] == [list(_PYTEST)]
+    assert estado["rotulo"] == "check-selecionado"
+    assert any("seleção sem testes para .; rodando completo" in l
+               for l in logs)
+
+
+def test_selecao_degradada_e_toca_codigo() -> None:
+    """Helpers `_selecao_degradada` e `_toca_codigo` cobrem os limites."""
+    assert mod._selecao_degradada(["mvn", "-B", "-q", "test-compile"])
+    assert mod._selecao_degradada(
+        ["/usr/bin/python3", "-m", "compileall", "-q", "a.py"])
+    assert not mod._selecao_degradada(
+        ["/usr/bin/python3", "-m", "pytest", "-q", "tests/test_x.py"])
+    assert not mod._selecao_degradada(["mvn", "-B", "-q", "test"])
+    assert mod._selecao_degradada(["python3", "-m", "compileall"])
+    # toca código: extensões, src no início e no meio, prefixo e apagados
+    assert not mod._toca_codigo("", ["docs/a.md", "leiame.txt"])
+    assert mod._toca_codigo("", ["docs/a.md", "app.py"])
+    assert mod._toca_codigo("", ["src/main/resources/a.yml"])
+    assert mod._toca_codigo("", ["web/lib/src/A.kt"])
+    assert not mod._toca_codigo("web", ["web/lib/README.md"])
+    assert mod._toca_codigo("web", ["web/lib/src/A.kt"])
+    assert mod._toca_codigo("", ["pkg/apagado.py"])  # lista completa
+
+
+
 # ------------------------------------------------------- config e globs
 
 
