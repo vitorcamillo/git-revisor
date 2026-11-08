@@ -231,6 +231,23 @@ def test_disparo_substitui_antiga_de_outro_sha_e_pula_mesma(
 
 # --------------------------------------- rodar_checks com falha de suíte
 
+def test_falha_de_commit_reescrito_e_apagada(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Falha de suíte de sha que sumiu de todas as branches (amend/rebase)
+    é apagada no check final, em vez de ficar para sempre."""
+    _commit(repo, {"a.txt": "1\n"}, "feat: a")
+    sha = _commit(repo, {"a.txt": "2\n"}, "feat: b")
+    _git(repo, "config", "revisor.checkFinal", "selecionado")
+    _escrever_json(mod.base_dir() / "suite-falhou.json",
+                   {"sha": "f" * 40, "base": "", "relatorio": "falhou",
+                    "quando": mod.agora_iso()})
+    monkeypatch.setattr(mod, "_rodar_checks_selecionados",
+                        lambda *a, **k: (True, ""))
+    ok, _rel = mod.rodar_checks(sha, str(repo))
+    assert ok
+    assert not (mod.base_dir() / "suite-falhou.json").exists()
+
+
 def test_rodar_checks_falha_suite_forca_completo_e_apaga(
         repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """`suite-falhou.json` presente com `selecionado`: roda o completo e,
@@ -587,6 +604,48 @@ def test_retentar_push_segurado_de_novo_volta_a_esperar(
     assert all(t != "Push ainda bloqueado" for t, _m in avisos)
     assert any("segurado de novo" in l for l in logs)
     assert not pedido.exists()
+
+
+def test_retentar_push_segurado_sempre_esgota_teto(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Segurado em toda tentativa: para no teto (sem laço infinito), com
+    'Push segue segurado' e sem 'Push enviado'."""
+    _commit(repo, {"a.txt": "1\n"}, "feat: a")
+    _git(repo, "checkout", "-q", "-b", "main")
+    sha = _commit(repo, {"a.txt": "2\n"}, "feat: v1")
+    pedido = mod.base_dir() / "retentar-push" / f"{sha}.json"
+    _escrever_json(pedido,
+                   {"remote": "origem", "remote_ref": "refs/heads/main",
+                    "local_ref": "refs/heads/main",
+                    "quando": mod.agora_iso()})
+    marcador = mod.MARCADOR_PUSH_SEGURADO
+    resultados = [_Proc(1, "", f"remote: revisor: {marcador}")
+                  for _ in range(mod.MAX_SEGURADAS_RETENTAR + 5)]
+    chamadas: list[list[str]] = []
+    _gravar_git_push(monkeypatch, resultados, chamadas)
+    _condicoes_livres(monkeypatch)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    avisos: list[tuple[str, str]] = []
+    monkeypatch.setattr(mod, "notificar",
+                        lambda titulo, msg: avisos.append((titulo, msg)))
+    monkeypatch.setattr(mod, "log", lambda msg: None)
+    rc = mod.cmd_retentar_push(sha)
+    assert rc == 1
+    pushes = [c for c in chamadas if c and c[0] == "push"]
+    assert len(pushes) == mod.MAX_SEGURADAS_RETENTAR
+    assert [t for t, _m in avisos] == ["Push segue segurado"]
+    assert not pedido.exists()
+
+
+def test_apagar_suite_fundo_por_token_sem_pid(repo: Path) -> None:
+    """Filho identifica o próprio registro pelo token mesmo sem pid gravado."""
+    arq = mod.base_dir() / "suite-fundo.json"
+    _escrever_json(arq, {"sha": "x", "base": "", "token": "t1",
+                         "quando": mod.agora_iso()})
+    mod._apagar_suite_fundo_se_minha(None, "outro")
+    assert arq.exists()
+    mod._apagar_suite_fundo_se_minha(None, "t1")
+    assert not arq.exists()
 
 
 def test_retentar_push_falha_nao_segurada_notifica_bloqueio(

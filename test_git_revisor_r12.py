@@ -82,6 +82,20 @@ def test_ler_errata_corta_no_teto(repo: Path, monkeypatch: pytest.MonkeyPatch) -
     assert len(lida.encode("utf-8")) <= mod.MAX_ERRATA
 
 
+def test_ler_errata_acima_do_teto_mantem_entrada_nova(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Entradas são acrescentadas no fim: acima do teto, a cauda (com a
+    entrada nova) é que entra, sem linha parcial no começo."""
+    antigo = "".join(f"- {i:07d}: entrada antiga {i}\n" for i in range(50))
+    novo = "- abc1234: entrada nova\n"
+    sha = _commit(repo, {".revisor/errata.md": antigo + novo}, "docs: errata")
+    monkeypatch.setattr(mod, "MAX_ERRATA", 200)
+    lida = mod.ler_errata(sha)
+    assert lida.endswith(novo)
+    assert len(lida.encode("utf-8")) <= mod.MAX_ERRATA
+    assert all(linha.startswith("- ") for linha in lida.splitlines())
+
+
 # ----------------------------------------------------------- intencao_commits
 
 def test_intencao_commits_com_ponta_inclui_errata(repo: Path) -> None:
@@ -182,4 +196,14 @@ def test_caminhos_proibidos_errata_como_unico_arquivo_novo(
     assert mod.caminhos_proibidos(str(wt)) == []
     # mas outro arquivo novo sob .revisor/ é proibido
     (wt / ".revisor" / "contexto.md").write_text("worker\n", encoding="utf-8")
+    assert ".revisor/contexto.md" in mod.caminhos_proibidos(str(wt))
+
+
+def test_caminhos_proibidos_rename_do_dono_e_barrado(repo: Path) -> None:
+    """`git mv` de `.revisor/contexto.md` (dono) para errata.md é barrado:
+    a origem também é verificada."""
+    sha = _commit(repo, {".revisor/contexto.md": "dono\n"}, "docs: contexto")
+    wt = repo.with_name("wt4")
+    _git(repo, "worktree", "add", "--detach", str(wt), sha)
+    _git(wt, "mv", ".revisor/contexto.md", ".revisor/errata.md")
     assert ".revisor/contexto.md" in mod.caminhos_proibidos(str(wt))

@@ -335,12 +335,25 @@ def ler_errata(ponta: str) -> str | None:
     """Lê a errata de mensagens (`.revisor/errata.md`) na ponta, limitada.
 
     Formato livre por linha; convenção `- <sha7>: <o que o commit
-    realmente faz>`. Ausente na árvore da ponta devolve None.
+    realmente faz>`. Ausente na árvore da ponta devolve None. Entradas
+    novas são acrescentadas no FIM do arquivo: acima do teto corta-se o
+    início (as mais antigas) e mantém-se a cauda, para que a entrada
+    recém-escrita sempre entre no prompt.
     """
     p = git(["show", f"{ponta}:.revisor/errata.md"])
     if p.returncode != 0 or not p.stdout:
         return None
-    return p.stdout.encode("utf-8")[:MAX_ERRATA].decode("utf-8", "ignore")
+    dados = p.stdout.encode("utf-8")
+    if len(dados) <= MAX_ERRATA:
+        return p.stdout
+    inicio = len(dados) - MAX_ERRATA
+    cauda = dados[inicio:].decode("utf-8", "ignore")
+    if dados[inicio - 1:inicio] != b"\n":
+        # corte no meio de uma linha: descarta esse pedaço inicial
+        quebra = cauda.find("\n")
+        if quebra >= 0:
+            cauda = cauda[quebra + 1:]
+    return cauda
 
 
 def notificar(titulo: str, msg: str) -> None:
@@ -382,6 +395,8 @@ CHECK_CEDIDO = "check interrompido: push esperando"
 # impresso pelo hook quando o push é segurado por lock/infra (retentável);
 # retentar-push reconhece uma retentativa segurada DE NOVO por esse texto
 MARCADOR_PUSH_SEGURADO = "push segurado: os testes não puderam rodar agora"
+# teto de "segurado de novo" seguidos no retentar-push (além do prazo)
+MAX_SEGURADAS_RETENTAR = 10
 
 
 def check_ocupado(relatorio: str) -> bool:
@@ -467,17 +482,21 @@ def mem_minima_mb() -> int:
         return 3072
 
 
-def esperar_memoria(limite_s: int = 600) -> bool:
+def esperar_memoria(limite_s: int = 600,
+                    abortar: Callable[[], bool] | None = None) -> bool:
     """Espera MemAvailable chegar a `revisor.memMinimaMb`; True se atingiu.
 
     Sonda a cada 15 s até `limite_s` (padrão 600). Sem /proc/meminfo
-    legível considera ok (não há como medir).
+    legível considera ok (não há como medir). Com `abortar`, devolve
+    False assim que ele pedir a vez (ex.: push esperando).
     """
     fim = time.monotonic() + limite_s
     while True:
         mb = mem_disponivel_mb()
         if mb is None or mb >= mem_minima_mb():
             return True
+        if abortar is not None and abortar():
+            return False
         if time.monotonic() >= fim:
             return False
         time.sleep(15)
@@ -2095,8 +2114,14 @@ def _executar_checks(
                 _pular(f"check pulado: indisponível/sem RAM "
                        f"(exit {proc.returncode})")
                 continue
-            # check final: nada pulado — esperar memória e repetir UMA vez
-            esperar_memoria()
+            # check final: nada pulado — esperar memória e repetir UMA vez.
+            # Com `abortar`, a espera também cede a vez (não segura o lock
+            # de checks por até 600 s enquanto um push espera)
+            esperar_memoria(abortar=abortar)
+            if abortar is not None and abortar():
+                motivo = f"{CHECK_CEDIDO}: {comando_str} em {prefixo or '.'}"
+                log(motivo)
+                return False, motivo
             log(f"{rotulo_log}: repetindo após falha de infra "
                 f"(exit {proc.returncode}): {comando_str[:120]}")
             inicio = time.monotonic()
@@ -2364,10 +2389,14 @@ def suite_completa_em_cache(sha: str, topo: str, base: str) -> bool:
     return _deteccao_toda_em_cache(arvore, arquivos)
 
 
+# variável que o pai passa ao filho `suite-completa` com o token do seu registro
+TOKEN_SUITE_FUNDO_ENV = "REVISOR_SUITE_FUNDO_TOKEN"
+
+
 def disparar_suite_completa(local_sha: str, base: str, topo: str) -> None:
     """Dispara `suite-completa <local_sha>` desacoplado, se couber.
 
-    Grava `suite-fundo.json` em `base_dir()` (sha, base, pid, quando).
+    Grava `suite-fundo.json` em `base_dir()` (sha, base, token, pid, quando).
     Suíte anterior de OUTRO sha com pid vivo é morta (SIGTERM no grupo) e
     substituída — a árvore nova contém a antiga; mesmo sha com pid vivo
     não dispara de novo.
@@ -2390,7 +2419,11 @@ def disparar_suite_completa(local_sha: str, base: str, topo: str) -> None:
                     os.killpg(pid_ant, signal.SIGTERM)
                 except (ProcessLookupError, OSError):
                     pass
-    dados = {"sha": local_sha, "base": base, "quando": agora_iso()}
+    # token gravado ANTES do Popen e repassado ao filho por ambiente: o filho
+    # se reconhece por ele mesmo que leia o arquivo antes de o pid ser gravado
+    token = os.urandom(8).hex()
+    dados = {"sha": local_sha, "base": base, "quando": agora_iso(),
+             "token": token}
     try:
         caminho.parent.mkdir(parents=True, exist_ok=True)
         caminho.write_text(json.dumps(dados, ensure_ascii=False) + "\n",
@@ -2408,7 +2441,8 @@ def disparar_suite_completa(local_sha: str, base: str, topo: str) -> None:
             [sys.executable, str(Path(__file__).resolve()),
              "suite-completa", local_sha],
             start_new_session=True, stdin=subprocess.DEVNULL,
-            stdout=arq_log, stderr=arq_log, cwd=topo)
+            stdout=arq_log, stderr=arq_log, cwd=topo,
+            env={**os.environ, TOKEN_SUITE_FUNDO_ENV: token})
     except OSError as exc:
         log(f"suíte em fundo: não consegui disparar: {exc}")
         return
@@ -2441,12 +2475,20 @@ def disparar_suite_fundo_se_preciso(novos: list[str], local_sha: str,
     disparar_suite_completa(local_sha, base, topo)
 
 
-def _apagar_suite_fundo_se_minha(pid: int | None) -> None:
-    """Apaga suite-fundo.json se ainda registrar o pid dado."""
-    if not isinstance(pid, int) or pid <= 0:
-        return
+def _apagar_suite_fundo_se_minha(pid: int | None,
+                                 token: str | None = None) -> None:
+    """Apaga suite-fundo.json se ainda for o registro da suíte que chama.
+
+    Com `token` (repassado pelo pai) a identidade é o token; sem ele, o pid.
+    """
     dados = _ler_json(base_dir() / "suite-fundo.json")
-    if dados and dados.get("pid") == pid:
+    if not dados:
+        return
+    if token:
+        dono = dados.get("token") == token
+    else:
+        dono = isinstance(pid, int) and pid > 0 and dados.get("pid") == pid
+    if dono:
         try:
             (base_dir() / "suite-fundo.json").unlink(missing_ok=True)
         except OSError:
@@ -2584,9 +2626,15 @@ def rodar_checks(sha: str, topo: str, base: str | None = None,
             log(f"check final: suíte completa falhou em {sha7(sha_falha)}; "
                 "rodando completo até ficar verde")
             falha_suite = True
+        elif sha_falha is None or not em_alguma_branch(sha_falha):
+            # commit reescrito (amend/rebase) ou registro inválido: a falha
+            # não existe mais em branch alguma — apagar, senão ficaria para sempre
+            log("suíte falhou em commit que não está mais em branch "
+                f"({sha7(sha_falha) if sha_falha else '?'}); apagando a falha")
+            _apagar_suite_falhou()
         else:
             log(f"suíte falhou em outra linha "
-                f"({sha7(sha_falha) if sha_falha else '?'}); ignorando")
+                f"({sha7(sha_falha)}); ignorando")
     if selecionado and not falha_suite:
         if any(_forca_completo(a) for a in arquivos):
             log("check final: arquivo de build/config alterado; "
@@ -3923,14 +3971,16 @@ def caminhos_proibidos(tmp: str) -> list[str]:
     proibidos = []
     # -uall: diretório novo não rastreado viria só como ".github/" e escaparia
     for linha in git(["status", "--porcelain", "-uall"], cwd=tmp).stdout.splitlines():
-        caminho = linha[3:].strip().strip('"')
-        if " -> " in caminho:
-            caminho = caminho.split(" -> ", 1)[1]
-        if caminho.startswith((".git/", ".github/workflows/")):
-            proibidos.append(caminho)
-        elif (caminho.startswith(".revisor/")
-              and caminho != ".revisor/errata.md"):
-            proibidos.append(caminho)
+        # rename ("R  origem -> destino"): origem E destino são verificados —
+        # senão apagar um arquivo do dono via git mv passaria despercebido
+        caminhos = [p.strip().strip('"')
+                    for p in linha[3:].split(" -> ")]
+        for caminho in caminhos:
+            if caminho.startswith((".git/", ".github/workflows/")):
+                proibidos.append(caminho)
+            elif (caminho.startswith(".revisor/")
+                  and caminho != ".revisor/errata.md"):
+                proibidos.append(caminho)
     return proibidos
 
 
@@ -4996,7 +5046,8 @@ def cmd_retentar_push(sha_curto: str) -> int:
     desiste sem push: o próximo push cobre. Roda `git push <remote>
     <local_ref>:<remote_ref>` (timeout de 3 h) e notifica o resultado. Se o
     push for segurado DE NOVO pelo hook (marcador retentável), volta ao
-    laço de espera dentro do mesmo prazo, sem notificar erro; só falha que
+    laço de espera dentro do mesmo prazo e até `MAX_SEGURADAS_RETENTAR`
+    vezes seguidas, sem notificar erro; só falha que
     não seja segurado-retentável (reprovação real, erro de rede) notifica
     "Push ainda bloqueado". Sempre apaga o pedido ao final.
     """
@@ -5026,8 +5077,16 @@ def cmd_retentar_push(sha_curto: str) -> int:
     if horas <= 0:
         horas = 6.0
     fim = time.monotonic() + horas * 3600
+    seguradas = 0
     try:
         while True:
+            # prazo conferido antes de cada volta: um push segurado pode
+            # ser caro (hook, revisão por IA, espera de memória)
+            if time.monotonic() >= fim:
+                notificar("Push segue segurado",
+                          f"{sha7(sha)}: a máquina não liberou em {horas:g} h; "
+                          "rode git push de novo quando puder")
+                return 1
             p_ref = git(["rev-parse", local_ref], cwd=topo)
             if p_ref.returncode != 0 or p_ref.stdout.strip() != sha:
                 log("retentar-push: branch andou; o próximo push cobre")
@@ -5050,18 +5109,21 @@ def cmd_retentar_push(sha_curto: str) -> int:
                 fim_txt = p.stderr.strip() or p.stdout.strip() or "sem detalhes"
                 if MARCADOR_PUSH_SEGURADO in fim_txt:
                     # o hook segurou a retentativa DE NOVO (lock/infra):
-                    # voltar a esperar dentro do mesmo prazo, sem erro
+                    # esperar e voltar, dentro do mesmo prazo e até o teto
+                    seguradas += 1
+                    if seguradas >= MAX_SEGURADAS_RETENTAR:
+                        notificar("Push segue segurado",
+                                  f"{sha7(sha)}: segurado {seguradas} vezes "
+                                  "seguidas; rode git push de novo quando "
+                                  "puder")
+                        return 1
                     log("retentar-push: segurado de novo; "
                         "esperando a máquina liberar")
+                    time.sleep(60)
                     continue
                 ultimas = "\n".join(fim_txt.splitlines()[-5:])
                 notificar("Push ainda bloqueado",
                           f"Push ainda bloqueado: {ultimas}"[:500])
-                return 1
-            if time.monotonic() >= fim:
-                notificar("Push segue segurado",
-                          f"{sha7(sha)}: a máquina não liberou em {horas:g} h; "
-                          "rode git push de novo quando puder")
                 return 1
             time.sleep(60)
     finally:
@@ -5084,13 +5146,14 @@ def cmd_suite_completa(sha_curto: str) -> int:
     teria bloqueado por isso). Falha real grava `suite-falhou.json` e
     notifica — o próximo push roda o completo até ficar verde. Verde
     apaga falha registrada de sha ancestral. Sempre apaga
-    `suite-fundo.json` se ainda for o dele (mesmo pid).
+    `suite-fundo.json` se ainda for o dele (mesmo token, ou pid sem token).
     """
     sha = sha_completo(sha_curto)
     topo = toplevel()
     caminho = base_dir() / "suite-fundo.json"
     dados = _ler_json(caminho)
     pid_proprio = dados.get("pid") if dados else None
+    token_proprio = os.environ.get(TOKEN_SUITE_FUNDO_ENV) or None
     base = dados.get("base") if dados else None
     if not isinstance(base, str) or not base:
         base = pai1_ou_vazio(sha)
@@ -5134,7 +5197,7 @@ def cmd_suite_completa(sha_curto: str) -> int:
                       "roda a suíte completa e só passa com ela verde")
             return 1
     finally:
-        _apagar_suite_fundo_se_minha(pid_proprio)
+        _apagar_suite_fundo_se_minha(pid_proprio, token_proprio)
 
 
 def cmd_limpar() -> int:
