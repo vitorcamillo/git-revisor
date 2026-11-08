@@ -101,7 +101,8 @@ def _checks_fake(monkeypatch: pytest.MonkeyPatch, codigos: list[tuple[int, str]]
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
     monkeypatch.setattr(mod, "log", logs.append)
-    monkeypatch.setattr(mod, "esperar_memoria", lambda limite_s=600: True)
+    monkeypatch.setattr(mod, "esperar_memoria",
+                        lambda limite_s=600, **_k: True)
     return estado
 
 
@@ -124,6 +125,25 @@ def test_estrito_infra_repeticao_passa(
     estado = _checks_fake(monkeypatch, [(137, ""), (0, "")], tmp_path)
     ok, rel = mod._executar_checks(checks, str(tmp_path), 10, estrito=True)
     assert ok is True and rel == ""
+    assert estado["execucoes"] == 2
+
+
+def test_estrito_infra_sem_abortar_espera_memoria_curta(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sem `abortar` (check final do push com o lock de checks preso), a
+    espera por memória da repetição estrita usa o limite curto, não 600 s."""
+    checks = [("", ["/usr/bin/ferramenta", "test"], "", False)]
+    limites: list[int] = []
+
+    def _espera(limite_s: int = 600, **_k: object) -> bool:
+        limites.append(limite_s)
+        return True
+
+    estado = _checks_fake(monkeypatch, [(137, ""), (137, "")], tmp_path)
+    monkeypatch.setattr(mod, "esperar_memoria", _espera)
+    ok, _rel = mod._executar_checks(checks, str(tmp_path), 10, estrito=True)
+    assert ok is False
+    assert limites == [mod.ESPERA_MEMORIA_SEM_ABORTAR_S]
     assert estado["execucoes"] == 2
 
 

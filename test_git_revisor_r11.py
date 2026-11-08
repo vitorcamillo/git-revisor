@@ -552,6 +552,37 @@ def test_check_retentavel_aceita_cedido() -> None:
     assert mod.check_retentavel("- [ALTA] falha real") is False
 
 
+def test_rodar_checks_completos_detectados_repassa_abortar(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Caminho de checks DETECTADOS também repassa `abortar` ao
+    `_executar_checks`: a suíte em fundo cede a vez a um push."""
+    _commit(repo, {"a.txt": "1\n"}, "feat: a")
+    sha = _commit(repo, {"src/x.py": "x = 1\n"}, "feat: x")
+    _git(repo, "config", "revisor.cacheChecks", "false")
+    monkeypatch.setattr(
+        mod, "detectar_checks",
+        lambda tmp, topo, pulos, ausentes: [("src", ["pytest", "-q"], "")])
+    recebidos: list[dict] = []
+
+    def _fake(checks, tmp, timeout, pulos=None, **k):
+        recebidos.append({"checks": list(checks), **k})
+        return True, ""
+
+    monkeypatch.setattr(mod, "_executar_checks", _fake)
+
+    def _marcador() -> bool:
+        return False
+
+    ok, rel = mod._rodar_checks_completos(sha, str(repo), None,
+                                          abortar=_marcador)
+    assert ok is True and rel == ""
+    assert len(recebidos) == 1
+    # 4-upla de check detectado (eh_manual False) e abortar repassado
+    assert recebidos[0]["checks"][0][3] is False
+    assert recebidos[0]["abortar"] is _marcador
+    assert recebidos[0]["estrito"] is True
+
+
 # ------------------------------------------- 4b: retentar-push segurado de novo
 
 def _gravar_git_push(monkeypatch: pytest.MonkeyPatch,

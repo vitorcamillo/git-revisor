@@ -397,6 +397,10 @@ CHECK_CEDIDO = "check interrompido: push esperando"
 MARCADOR_PUSH_SEGURADO = "push segurado: os testes não puderam rodar agora"
 # teto de "segurado de novo" seguidos no retentar-push (além do prazo)
 MAX_SEGURADAS_RETENTAR = 10
+# espera por memória na repetição estrita SEM `abortar` (check final do
+# push segurando o lock de checks): curta, para não prender o lock por
+# até 600 s enquanto outro push espera
+ESPERA_MEMORIA_SEM_ABORTAR_S = 60
 
 
 def check_ocupado(relatorio: str) -> bool:
@@ -1997,7 +2001,9 @@ def _executar_checks(
     com polling de ~5 s: se `abortar()` ficar True (ex.: push esperando),
     o grupo do comando recebe SIGTERM (depois SIGKILL) e a execução
     devolve `CHECK_CEDIDO` sem reprovar. Sem `abortar`, o comportamento
-    é o de sempre (`subprocess.run`).
+    é o de sempre (`subprocess.run`) e a espera por memória da repetição
+    estrita usa o limite curto `ESPERA_MEMORIA_SEM_ABORTAR_S`: sem como
+    ceder a vez, não prender o lock de checks por 600 s.
     """
     coletor = pulos if pulos is not None else []
     cache_ligado = bool(arvore) and cache_checks_ativo(topo)
@@ -2115,9 +2121,12 @@ def _executar_checks(
                        f"(exit {proc.returncode})")
                 continue
             # check final: nada pulado — esperar memória e repetir UMA vez.
-            # Com `abortar`, a espera também cede a vez (não segura o lock
-            # de checks por até 600 s enquanto um push espera)
-            esperar_memoria(abortar=abortar)
+            # Com `abortar`, a espera também cede a vez; sem `abortar` (hook
+            # do push segurando o lock de checks), a espera é curta para não
+            # prender o lock por até 600 s enquanto outro push espera
+            esperar_memoria(limite_s=(600 if abortar is not None
+                                      else ESPERA_MEMORIA_SEM_ABORTAR_S),
+                            abortar=abortar)
             if abortar is not None and abortar():
                 motivo = f"{CHECK_CEDIDO}: {comando_str} em {prefixo or '.'}"
                 log(motivo)
@@ -2761,7 +2770,8 @@ def _rodar_checks_completos(
                 kwargs = ({"arvore": arvore, "topo": topo}
                           if arvore else {})
                 ok, rel = _executar_checks(filtrados, tmp, timeout_check,
-                                           pulos, estrito=True, **kwargs)
+                                           pulos, estrito=True,
+                                           abortar=abortar, **kwargs)
         _fechar_pulos(pulos)
         return ok, rel
 
