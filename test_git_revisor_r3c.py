@@ -62,11 +62,11 @@ def test_grupos_do_push_guloso_e_limite_de_grupos(
     monkeypatch.setattr(
         mod, "dividir_em_partes",
         lambda diff: [""] * int(diff.split(":")[1]))
-    monkeypatch.setattr(mod, "cfg", lambda chave, padrao: "30")
+    monkeypatch.setattr(mod, "cfg", lambda chave, padrao: padrao if chave == "maxPartes" else "30")
 
     assert mod.grupos_do_push(shas) == [shas[:2], shas[2:]]
 
-    monkeypatch.setattr(mod, "cfg", lambda chave, padrao: "2")
+    monkeypatch.setattr(mod, "cfg", lambda chave, padrao: padrao if chave == "maxPartes" else "2")
     assert mod.grupos_do_push(shas) is None
 
 
@@ -83,7 +83,7 @@ def test_grupos_do_push_um_grupo_e_commit_isolado_grande(
     monkeypatch.setattr(
         mod, "dividir_em_partes",
         lambda diff: [""] * int(diff.split(":")[1]))
-    monkeypatch.setattr(mod, "cfg", lambda chave, padrao: "30")
+    monkeypatch.setattr(mod, "cfg", lambda chave, padrao: padrao if chave == "maxPartes" else "30")
 
     assert mod.grupos_do_push(shas) == [shas]
 

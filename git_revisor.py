@@ -126,13 +126,15 @@ VAZIO_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 MAX_DIFF_BYTES = 80_000
 MAX_PARTES = 6
 MAX_LOTE = 20
-MOTIVO_GRANDE = ("mudança grande demais para revisão automática (> 6 partes); "
+MOTIVO_GRANDE = ("mudança grande demais para revisão automática "
+                 "(acima do limite de partes); "
                  "revise manualmente e use REVISOR_PULAR=1 git push")
 MAX_RELATORIO = 12_000
 MAX_INTENCAO = 4_000
 MAX_EVIDENCIA = 3_000
 MAX_CONTEXTO_REPO = 3_000
 MAX_ERRATA = 3_000
+MAX_DELTA = 12_000
 MAX_PROMPT_BYTES = 120_000
 # *.txt fica fora: requirements.txt, robots.txt e CMakeLists.txt não são baixo risco
 BAIXO_RISCO = ("*.md", "*.rst", "docs/**", "LICENSE*", ".gitignore",
@@ -577,6 +579,67 @@ def arquivo_trava_checks() -> Path:
     return estado / "git-revisor" / "checks.lock"
 
 
+COTA_ESPERA_PADRAO_S = 600
+COTA_ESPERA_MAX_S = 24 * 3600
+_COTA_RESET_RE = re.compile(r"worker-ask-quota-reset:\s*(\d+)")
+
+
+def arquivo_cota_workers() -> Path:
+    """Arquivo JSON com o prazo de cota por família de worker."""
+    estado = Path(os.environ.get("XDG_STATE_HOME") or
+                  Path.home() / ".local/state")
+    return estado / "git-revisor" / "cota-workers.json"
+
+
+def reset_de_cota(stderr: str) -> int | None:
+    """Epoch da última linha `worker-ask-quota-reset: <epoch>`; None se ausente."""
+    achados = _COTA_RESET_RE.findall(stderr or "")
+    if not achados:
+        return None
+    try:
+        return int(achados[-1])
+    except ValueError:
+        return None
+
+
+def marcar_sem_cota(familia: str, ate: int) -> None:
+    """Registra que `familia` está sem cota até o epoch `ate` (escrita atômica)."""
+    try:
+        caminho = arquivo_cota_workers()
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            dados = json.loads(caminho.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            dados = {}
+        if not isinstance(dados, dict):
+            dados = {}
+        dados[familia] = int(ate)
+        temporario = caminho.parent / (caminho.name + ".tmp")
+        temporario.write_text(json.dumps(dados, ensure_ascii=False) + "\n",
+                              encoding="utf-8")
+        os.replace(temporario, caminho)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def sem_cota_ate(familia: str) -> int | None:
+    """Epoch até o qual `familia` está sem cota; None se sem registro."""
+    try:
+        dados = json.loads(arquivo_cota_workers().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(dados, dict):
+        return None
+    valor = dados.get(familia)
+    if isinstance(valor, bool):
+        return None
+    if isinstance(valor, int):
+        return valor
+    if isinstance(valor, float) and valor.is_integer():
+        return int(valor)
+    return None
+
+
 def _baixar_prioridade() -> None:
     """Faz o build morrer primeiro em falta de RAM, preservando os apps."""
     try:
@@ -922,7 +985,8 @@ def _modo_de(modo_args: list[str]) -> str:
 
 
 def chamar_comando(cmd: list[str], cwd: str, modo_args: list[str],
-                   timeout: int) -> tuple[int, str]:
+                   timeout: int,
+                   stderr_out: list[str] | None = None) -> tuple[int, str]:
     """Roda `<cmd> --cwd <dir> <modo_args>` e devolve (código, stdout).
 
     O processo nasce em sessão própria; no timeout o grupo inteiro recebe
@@ -955,6 +1019,8 @@ def chamar_comando(cmd: list[str], cwd: str, modo_args: list[str],
         return 1, ""
     try:
         saida, erro = proc.communicate(timeout=timeout)
+        if stderr_out is not None:
+            stderr_out.append(erro)
         if proc.returncode != 0:
             log(f"{nome} exit {proc.returncode} stderr: {resumo_stderr(erro)}")
         _custo(str(proc.returncode), saida)
@@ -1078,6 +1144,15 @@ def diff_entre(base: str, ponta: str) -> str:
     return p.stdout
 
 
+def max_partes() -> int:
+    """Limite de partes por revisão (`revisor.maxPartes`, padrão MAX_PARTES)."""
+    try:
+        valor = int(cfg("maxPartes", str(MAX_PARTES)))
+    except ValueError:
+        return MAX_PARTES
+    return max(1, min(12, valor))
+
+
 def grupos_do_push(novos: list[str]) -> list[list[str]] | None:
     """Agrupa commits consecutivos respeitando os limites do pre-push."""
     try:
@@ -1091,9 +1166,11 @@ def grupos_do_push(novos: list[str]) -> list[list[str]] | None:
         melhor_fim: int | None = None
         melhor_partes = 0
         for fim in range(inicio, len(novos)):
+            texto_d = diff_entre(pai1_ou_vazio(novos[inicio]), novos[fim])
+            filtrado_d, removidos_d = remover_baixo_risco(texto_d)
             partes = dividir_em_partes(
-                diff_entre(pai1_ou_vazio(novos[inicio]), novos[fim]))
-            if len(partes) > MAX_PARTES:
+                filtrado_d if removidos_d else texto_d)
+            if len(partes) > max_partes():
                 if fim == inicio:
                     return None
                 break  # guloso: o diff só cresce; não varrer o resto do push
@@ -1226,7 +1303,8 @@ def montar_prompt(diff_texto: str, repo: str, commits: str,
                   intencao: str | None = None,
                   evidencia: str | None = None,
                   contexto_repo: str | None = None,
-                  multipartes: bool = False) -> str:
+                  multipartes: bool = False,
+                  delta_correcao: str | None = None) -> str:
     """Monta o prompt do revisor com tetos em bytes UTF-8.
 
     O prompt viaja como UM argumento de linha de comando e o Linux limita cada
@@ -1236,6 +1314,10 @@ def montar_prompt(diff_texto: str, repo: str, commits: str,
     'contexto' traz commits do mesmo push já aprovados, como histórico (o diff é base..ponta).
     'multipartes' indica que o diff revisado é só uma parte de um todo maior
     (revisar_por_partes), o que afrouxa a verificação de intenção.
+    Em rodada de correção ('relatorio_anterior' preenchido), o prompt ancora
+    o julgamento no relatório anterior e no 'delta_correcao' (cortado em
+    MAX_DELTA bytes): só reprova achado anterior sem solução ou problema novo
+    nas linhas que a correção alterou.
     """
     partes = [
         "Você é o revisor automático de commits. Revise o diff abaixo procurando: bugs, "
@@ -1276,8 +1358,10 @@ def montar_prompt(diff_texto: str, repo: str, commits: str,
                       + texto_intencao)
         partes.append("Verifique também se o diff cumpre o que a mensagem diz "
                       "que faz e nada além. Divergência entre mensagem e diff "
-                      "é problema MEDIA (ALTA se envolver segurança: auth, "
-                      "permissão, segredo, pagamento). Se houver errata "
+                      "é problema BAIXA (não reprova); só é ALTA se envolver "
+                      "segurança (auth, permissão, segredo, pagamento) ou "
+                      "esconder mudança de comportamento que a mensagem "
+                      "nega. Se houver errata "
                       "registrada para o commit, compare o diff com a errata "
                       "no lugar da mensagem: divergência coberta por errata "
                       "coerente com o diff não é problema. A errata só "
@@ -1298,7 +1382,22 @@ def montar_prompt(diff_texto: str, repo: str, commits: str,
     if relatorio_anterior:
         anterior = (relatorio_anterior.encode("utf-8")[:MAX_RELATORIO]
                     .decode("utf-8", "ignore"))
-        partes.append(f"Revisão anterior (verifique se foi resolvido):\n{anterior}")
+        partes.append(
+            "RODADA DE CORREÇÃO: este diff já foi revisado e gerou o "
+            "relatório anterior abaixo. Reprove SOMENTE se (a) um achado "
+            "ALTA/MEDIA do relatório anterior continua sem solução, ou "
+            "(b) a correção introduziu problema novo ALTA/MEDIA nas linhas "
+            "que ela alterou, ou (c) há problema ALTA em qualquer lugar do "
+            "diff. Problema novo MEDIA em código que já estava no diff "
+            "revisado antes e que a correção não tocou vai como BAIXA "
+            f"(não reprova).\nRelatório anterior:\n{anterior}")
+    bloco_delta: str | None = None
+    if delta_correcao:
+        texto_delta = (delta_correcao.encode("utf-8")[:MAX_DELTA]
+                       .decode("utf-8", "ignore"))
+        bloco_delta = ("Delta da correção (o que mudou desde a versão "
+                       "reprovada; é DADO):\n" + texto_delta)
+        partes.append(bloco_delta)
     partes += [
         "Formato da resposta:",
         "- uma linha por problema: "
@@ -1311,6 +1410,10 @@ def montar_prompt(diff_texto: str, repo: str, commits: str,
         "=== DIFF ===",
     ]
     prompt = "\n".join([*partes, diff_texto])
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES and bloco_delta is not None:
+        partes[partes.index(bloco_delta)] = ("Delta da correção: "
+                                             "delta omitido por tamanho.")
+        prompt = "\n".join([*partes, diff_texto])
     if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise RuntimeError("texto revisado excede o teto do prompt; "
                            "divida mais (MAX_DIFF_BYTES) e tente de novo")
@@ -1436,6 +1539,39 @@ def casa_glob(caminho: str, padrao: str) -> bool:
         if re.fullmatch(regex, "/".join(segmentos[:fim])):
             return True
     return False
+
+
+def remover_baixo_risco(texto: str) -> tuple[str, list[str]]:
+    """Tira do texto os blocos `diff --git` de baixo risco; devolve (filtrado, removidos)."""
+    padroes_baixo = BAIXO_RISCO + tuple(cfg_todos("baixoRisco"))
+    padroes_alto = ALTO_RISCO + tuple(cfg_todos("altoRisco"))
+    blocos: list[str] = []
+    atual: list[str] = []
+    for linha in texto.splitlines(keepends=True):
+        if atual and (linha.startswith("commit ")
+                      or linha.startswith("diff --git ")):
+            blocos.append("".join(atual))
+            atual = []
+        atual.append(linha)
+    if atual:
+        blocos.append("".join(atual))
+    if not blocos:
+        return texto, []
+    mantidos: list[str] = []
+    removidos: list[str] = []
+    for bloco in blocos:
+        m = re.search(r"^diff --git a/(.+?) b/(.+?)\s*$", bloco, re.MULTILINE)
+        if not m:
+            mantidos.append(bloco)
+            continue
+        caminho = m.group(2)
+        if (any(casa_glob(caminho, padrao) for padrao in padroes_baixo)
+                and not any(casa_glob(caminho, padrao)
+                            for padrao in padroes_alto)):
+            removidos.append(caminho)
+            continue
+        mantidos.append(bloco)
+    return "".join(mantidos), removidos
 
 
 def classificar_risco(base: str, ponta: str) -> tuple[str, list[str]]:
@@ -2916,22 +3052,35 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
                        risco_alto: list[str] | None = None,
                        intencao: str | None = None,
                        evidencia: str | None = None,
-                       contexto_repo: str | None = None) -> tuple[str, str, set[str]]:
+                       contexto_repo: str | None = None,
+                       delta_correcao: str | None = None) -> tuple[str, str, set[str]]:
     """Revisa o texto em partes; APROVADO só se TODAS as partes aprovarem.
 
     Qualquer REPROVADO reprova o conjunto (relatório = concatenação das partes
     reprovadas); SEM_COTA/ERRO/INCONCLUSIVO vale para o todo. Acima de
-    MAX_PARTES nem chama o revisor: mudança grande demais para aprovar.
+    max_partes() nem chama o revisor: mudança grande demais para aprovar.
     Parte já APROVADA e em cache (`revisor.cacheParte`) conta como aprovada
     sem chamar a IA, inclusive em rodada de correção; só as partes sem cache
     vão para o revisor. Devolve também as famílias do revisor de cada parte,
     as revisadas agora e as vindas do cache.
+    'delta_correcao' é repassado a cada parte via montar_prompt.
     """
+    limite = max_partes()
     partes = dividir_em_partes(texto)
     total = len(partes)
-    if total > MAX_PARTES:
-        log(f"texto revisado virou {total} partes (> {MAX_PARTES}); bloqueando")
-        return "GRANDE_DEMAIS", MOTIVO_GRANDE, set()
+    omitidos: list[str] = []
+    if total > limite:
+        filtrado, removidos = remover_baixo_risco(texto)
+        if removidos and len(dividir_em_partes(filtrado)) <= limite:
+            log(f"{len(removidos)} arquivo(s) de baixo risco fora da revisão "
+                f"por IA para caber em {limite} partes")
+            texto = filtrado
+            partes = dividir_em_partes(texto)
+            total = len(partes)
+            omitidos = removidos
+        else:
+            log(f"texto revisado virou {total} partes (> {limite}); bloqueando")
+            return "GRANDE_DEMAIS", MOTIVO_GRANDE, set()
     try:
         paralelo = max(1, min(6, int(cfg("paralelo", "3"))))
     except ValueError:
@@ -2952,16 +3101,24 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
                 set(familia_cache.values()))
 
     pendentes = [i for i in range(total) if i not in familia_cache]
+    frase_omitidos = ""
+    if omitidos:
+        nomes = ", ".join(omitidos[:30])
+        if len(omitidos) > 30:
+            nomes += f" e mais {len(omitidos) - 30}"
+        frase_omitidos = (" Arquivos de baixo risco omitidos desta revisão "
+                          f"(documentação/lockfile/fixture): {nomes}")
     prompts = {
         i: montar_prompt(
             partes[i], repo, commits, relatorio_anterior,
             f"PARTE {i + 1} de {total}. Cada parte é revisada numa chamada "
             "separada e independente: revise SÓ esta parte agora e termine "
-            "com o VEREDITO; não espere as outras partes.",
+            "com o VEREDITO; não espere as outras partes." + frase_omitidos,
             contexto, risco_alto=risco_alto,
             intencao=intencao, evidencia=evidencia,
             contexto_repo=contexto_repo,
-            multipartes=total > 1)
+            multipartes=total > 1,
+            delta_correcao=delta_correcao)
         for i in pendentes
     }
     autorreferida = set(MESMO_MODELO) | {"desconhecido"}
@@ -3194,6 +3351,10 @@ def hook_post_commit() -> int:
     """Dispara a revisão do commit recém-criado em segundo plano (se ativada)."""
     if not habilitado() or interno():
         return 0
+    try:
+        faxina_se_devida(toplevel())
+    except Exception:
+        pass
     if not segundo_plano_ativo():
         return 0  # a IA revisa o lote final no push, não commit a commit
     if operacao_em_andamento():
@@ -4040,13 +4201,47 @@ def rodar_worker(tarefa: str, cwd: str) -> str | None:
                ("REVISOR_CMD_WORKER3", "claude-ask --model haiku --effort high",
                 "write"))
     familias = ("glm", "muse", "codex", "claude")
-    for familia, (nome_env, padrao, modo) in zip(familias, degraus):
+    for i, (familia, (nome_env, padrao, modo)) in enumerate(zip(familias, degraus)):
         cmd = comando(nome_env, padrao)
+        ate = sem_cota_ate(familias[i])
+        if ate is not None and ate > time.time():
+            try:
+                hora = datetime.fromtimestamp(ate).strftime("%H:%M")
+            except (OSError, ValueError, OverflowError):
+                hora = "?"
+            log(f"worker {cmd[0]} pulado: sem cota até {hora}")
+            continue
+        erros: list[str] = []
         codigo, saida = chamar_comando(cmd, cwd, ["--mode", modo, tarefa],
                                        tempo_limite("REVISOR_TEMPO_WORKER",
-                                                    TEMPO_WORKER))
+                                                    TEMPO_WORKER),
+                                       stderr_out=erros)
         log(f"worker {cmd[0]} ({modo}) exit {codigo}: {saida.strip()[:200] or '(sem saída)'}")
-        if codigo == 0:
+        if codigo == 75:
+            agora = time.time()
+            reset = reset_de_cota("".join(erros))
+            if (reset is not None and reset > agora
+                    and reset <= agora + COTA_ESPERA_MAX_S):
+                prazo = reset
+            else:
+                prazo = int(agora) + COTA_ESPERA_PADRAO_S
+            marcar_sem_cota(familias[i], prazo)
+        elif codigo == 0:
+            try:
+                caminho = arquivo_cota_workers()
+                dados = json.loads(caminho.read_text(encoding="utf-8"))
+                if isinstance(dados, dict) and familias[i] in dados:
+                    del dados[familias[i]]
+                    if dados:
+                        temporario = caminho.parent / (caminho.name + ".tmp")
+                        temporario.write_text(
+                            json.dumps(dados, ensure_ascii=False) + "\n",
+                            encoding="utf-8")
+                        os.replace(temporario, caminho)
+                    else:
+                        caminho.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
             return familia_do_comando(cmd) or familia
     return None
 
@@ -4325,6 +4520,8 @@ def fluxo_correcao(sha_original: str, relatorio: str, topo: str,
     lote, vale só o commit. A correção herda o risco do lote (nunca é aprovada
     por regra) e só chega a `integrar_correcao` depois de passar nos checks
     determinísticos e na re-revisão por IA.
+    A re-revisão (inclusive a da retomada) recebe o delta entre o commit
+    corrigido e a correção, ancorada no relatório anterior.
     """
     sha_atual = sha_original
     lote = lote or [sha_original]
@@ -4338,13 +4535,15 @@ def fluxo_correcao(sha_original: str, relatorio: str, topo: str,
     if anterior:
         if esta_aprovado(anterior):
             return integrar_correcao(sha_original, anterior, topo)
+        # re-revisa de propósito: aprovar agora poupa uma rodada de worker
         veredito_ant, saida_ant, familias_ant = revisar_por_partes(
             diff_entre(base_original, anterior), topo,
             resumo_commits([anterior]),
             ler_relatorio(anterior) or relatorio,
             risco_alto=risco_alto,
             intencao=intencao_commits([anterior], ponta=anterior),
-            evidencia=evidencia_gate(anterior))
+            evidencia=evidencia_gate(anterior),
+            delta_correcao=diff_entre(sha_original, anterior))
         if veredito_ant != "APROVADO" and ia_primeiro:
             log(f"check completo evitado: IA {veredito_ant} antes do check")
         if veredito_ant == "APROVADO":
@@ -4405,11 +4604,13 @@ def fluxo_correcao(sha_original: str, relatorio: str, topo: str,
             relatorio = relatorio_check
             sha_atual = novo
             continue
+        delta = diff_entre(sha_atual, novo)
         veredito, saida, familias = revisar_por_partes(
             diff_entre(base_original, novo), topo, resumo_commits([novo]),
             relatorio, risco_alto=risco_alto,
             intencao=intencao_commits([novo], ponta=novo),
-            evidencia=evidencia_gate(novo))
+            evidencia=evidencia_gate(novo),
+            delta_correcao=delta)
         if veredito != "APROVADO" and ia_primeiro:
             log(f"check completo evitado: IA {veredito} antes do check")
         if veredito == "APROVADO":
@@ -5216,6 +5417,307 @@ def cmd_suite_completa(sha_curto: str) -> int:
         _apagar_suite_fundo_se_minha(pid_proprio, token_proprio)
 
 
+FAXINA_INTERVALO_S = 24 * 3600
+RETENCAO_ESTADO_DIAS = 30
+RETENCAO_TENTATIVA_DIAS = 14
+RETENCAO_CACHE_DIAS = 14
+
+
+def _dias_cfg(chave: str, padrao: int) -> int:
+    """Retenção em dias (`revisor.<chave>`); inteiro >= 1, senão o padrão."""
+    try:
+        valor = int(cfg(chave, str(padrao)))
+    except (ValueError, TypeError):
+        return padrao
+    return valor if valor >= 1 else padrao
+
+
+def faxina_repo(topo: str) -> dict[str, int]:
+    """Faxina barata do estado do repositório; nunca levanta exceção."""
+    cont = {"tentativas": 0, "estado": 0, "avisos": 0}
+    try:
+        corte_tent = time.time() - _dias_cfg(
+            "retencaoTentativaDias", RETENCAO_TENTATIVA_DIAS) * 86400
+        txt = git(["for-each-ref", "--format=%(refname)",
+                   "refs/revisor/tentativa/"], cwd=topo).stdout
+        refs = [r.strip() for r in txt.splitlines() if r.strip()]
+    except Exception as exc:
+        log(f"faxina: tentativas: {exc}")
+        refs = []
+    for ref in refs:
+        try:
+            original = ref.rsplit("/", 1)[-1]
+            if esta_aprovado(original) or not em_alguma_branch(original):
+                velha = True
+            else:
+                velha = False
+                p = git(["log", "-1", "--format=%ct", ref], cwd=topo)
+                if p.returncode == 0:
+                    try:
+                        velha = int(p.stdout.strip()) < corte_tent
+                    except (ValueError, TypeError):
+                        velha = False
+            if velha and git(["update-ref", "-d", ref],
+                             cwd=topo).returncode == 0:
+                cont["tentativas"] += 1
+        except Exception as exc:
+            log(f"faxina: tentativa {ref}: {exc}")
+    try:
+        corte_est = time.time() - _dias_cfg(
+            "retencaoEstadoDias", RETENCAO_ESTADO_DIAS) * 86400
+        try:
+            base = base_dir()
+        except Exception as exc:
+            log(f"faxina: estado: {exc}")
+            base = None
+        if base is not None:
+            for sub in ("relatorios", "aprovados", "checks-ok", "partes",
+                        "arvores", "deteccao"):
+                try:
+                    pasta = base / sub
+                    if not pasta.is_dir():
+                        continue
+                    for arq in pasta.iterdir():
+                        try:
+                            if arq.is_dir() and not arq.is_symlink():
+                                continue
+                            nome = arq.name
+                            if nome == "lock" or nome.startswith("log.txt"):
+                                continue
+                            try:
+                                idade = (arq.lstat().st_mtime
+                                         if arq.is_symlink()
+                                         else arq.stat().st_mtime)
+                            except OSError:
+                                continue
+                            if not arq.is_file() and not arq.is_symlink():
+                                continue
+                            if idade < corte_est:
+                                arq.unlink(missing_ok=True)
+                                cont["estado"] += 1
+                        except Exception as exc:
+                            log(f"faxina: estado {arq}: {exc}")
+                except Exception as exc:
+                    log(f"faxina: estado {sub}: {exc}")
+    except Exception as exc:
+        log(f"faxina: estado: {exc}")
+    try:
+        try:
+            pasta_avisos = pasta_push_esperando()
+        except Exception as exc:
+            log(f"faxina: avisos: {exc}")
+            pasta_avisos = None
+        if pasta_avisos is not None and pasta_avisos.exists():
+            for arq in sorted(pasta_avisos.iterdir()):
+                try:
+                    if arq.is_dir() and not arq.is_symlink():
+                        continue
+                    nome = arq.name
+                    if not nome.isdigit() or int(nome) <= 0:
+                        arq.unlink(missing_ok=True)
+                        cont["avisos"] += 1
+                        continue
+                    pid = int(nome)
+                    try:
+                        inicio = arq.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        inicio = ""
+                    try:
+                        expirado = _aviso_expirado(arq, inicio)
+                    except Exception:
+                        expirado = False
+                    try:
+                        idade = time.time() - arq.stat().st_mtime
+                    except OSError:
+                        idade = 0
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        arq.unlink(missing_ok=True)
+                        cont["avisos"] += 1
+                        continue
+                    except PermissionError:
+                        pass
+                    except OSError:
+                        continue
+                    if expirado or idade > 86400:
+                        arq.unlink(missing_ok=True)
+                        cont["avisos"] += 1
+                except Exception as exc:
+                    log(f"faxina: aviso {arq}: {exc}")
+    except Exception as exc:
+        log(f"faxina: avisos: {exc}")
+    if cont["tentativas"] or cont["estado"] or cont["avisos"]:
+        log(f"faxina: {cont['tentativas']} tentativa(s), "
+            f"{cont['estado']} arquivo(s), {cont['avisos']} aviso(s)")
+    return cont
+
+
+def faxina_cache_global() -> int:
+    """Faxina dos caches de worktree; devolve pastas removidas, sem exceção."""
+    removidas = 0
+    try:
+        ret = _dias_cfg("retencaoCacheDias", RETENCAO_CACHE_DIAS)
+        corte = time.time() - ret * 86400
+        raiz = Path(os.environ.get("XDG_CACHE_HOME")
+                    or Path.home() / ".cache") / "git-revisor"
+        if not raiz.is_dir():
+            return 0
+        pastas = sorted(raiz.iterdir())
+    except Exception as exc:
+        log(f"faxina: cache: {exc}")
+        return 0
+    for pasta in pastas:
+        try:
+            if not pasta.is_dir() and not pasta.is_symlink():
+                continue
+            wt = pasta / "wt"
+            if not wt.exists() and not wt.is_symlink():
+                continue
+            gitfile = wt / ".git"
+            alvo: Path | None = None
+            if gitfile.is_file():
+                try:
+                    texto = gitfile.read_text(encoding="utf-8").strip()
+                except OSError:
+                    texto = ""
+                if texto.startswith("gitdir:"):
+                    alvo = Path(texto[len("gitdir:"):].strip())
+                    if not alvo.is_absolute():
+                        alvo = wt / alvo
+                    if not alvo.exists() and not alvo.is_symlink():
+                        shutil.rmtree(pasta, ignore_errors=True)
+                        if not pasta.exists():
+                            removidas += 1
+                        continue
+            elif not gitfile.exists() and not gitfile.is_symlink():
+                shutil.rmtree(pasta, ignore_errors=True)
+                if not pasta.exists():
+                    removidas += 1
+                continue
+            try:
+                tempos: list[float] = []
+                try:
+                    tempos.append(pasta.stat().st_mtime)
+                except OSError:
+                    pass
+                try:
+                    tempos.append(wt.stat().st_mtime)
+                except OSError:
+                    pass
+                fechadura = pasta / "wt.lock"
+                try:
+                    if fechadura.exists():
+                        tempos.append(fechadura.stat().st_mtime)
+                except OSError:
+                    pass
+                if not tempos or max(tempos) >= corte:
+                    continue
+            except Exception as exc:
+                log(f"faxina: cache {pasta}: {exc}")
+                continue
+            try:
+                with trava(0, arquivo=pasta / "wt.lock") as conseguiu:
+                    if not conseguiu:
+                        continue
+                    dono_cwd: str | None = None
+                    try:
+                        if alvo is not None:
+                            xd = alvo
+                            if xd.is_file():
+                                xd = xd.parent
+                            dono_git = xd.parent.parent
+                            if dono_git.name == ".git":
+                                dono_cwd = str(dono_git.parent)
+                            else:
+                                dono_cwd = str(dono_git)
+                    except Exception:
+                        dono_cwd = None
+                    try:
+                        if dono_cwd is not None:
+                            git(["worktree", "remove", "--force", str(wt)],
+                                cwd=dono_cwd)
+                    except Exception as exc:
+                        log(f"faxina: cache {pasta}: {exc}")
+                    shutil.rmtree(wt, ignore_errors=True)
+                    try:
+                        if dono_cwd is not None:
+                            git(["worktree", "prune"], cwd=dono_cwd)
+                    except Exception:
+                        pass
+                    if not wt.exists() and not wt.is_symlink():
+                        removidas += 1
+            except Exception as exc:
+                log(f"faxina: cache {pasta}: {exc}")
+        except Exception as exc:
+            log(f"faxina: cache {pasta}: {exc}")
+    if removidas:
+        log(f"faxina: {removidas} cache(s) removido(s)")
+    return removidas
+
+
+def _carimbo_devido(carimbo: Path) -> bool:
+    """True se o carimbo não existe ou tem mais de FAXINA_INTERVALO_S."""
+    try:
+        return (time.time() - carimbo.stat().st_mtime) > FAXINA_INTERVALO_S
+    except OSError:
+        return True
+    except Exception:
+        return True
+
+
+def faxina_se_devida(topo: str) -> None:
+    """Roda cada faxina no máximo uma vez ao dia; nunca levanta, nada imprime."""
+    try:
+        try:
+            carimbo_repo = base_dir() / "faxina-ultima"
+        except Exception:
+            carimbo_repo = None
+        if carimbo_repo is not None:
+            try:
+                devido = _carimbo_devido(carimbo_repo)
+            except Exception:
+                devido = True
+            if devido:
+                try:
+                    carimbo_repo.parent.mkdir(parents=True, exist_ok=True)
+                    carimbo_repo.write_text(f"{time.time():.0f}\n",
+                                            encoding="utf-8")
+                except Exception as exc:
+                    log(f"faxina: carimbo repo: {exc}")
+                try:
+                    faxina_repo(topo)
+                except Exception as exc:
+                    log(f"faxina: repo: {exc}")
+        try:
+            estado = Path(os.environ.get("XDG_STATE_HOME")
+                          or Path.home() / ".local/state") / "git-revisor"
+            carimbo_cache = estado / "faxina-cache-ultima"
+        except Exception:
+            carimbo_cache = None
+        if carimbo_cache is not None:
+            try:
+                devido_cache = _carimbo_devido(carimbo_cache)
+            except Exception:
+                devido_cache = True
+            if devido_cache:
+                try:
+                    carimbo_cache.parent.mkdir(parents=True, exist_ok=True)
+                    carimbo_cache.write_text(f"{time.time():.0f}\n",
+                                             encoding="utf-8")
+                except Exception as exc:
+                    log(f"faxina: carimbo cache: {exc}")
+                try:
+                    faxina_cache_global()
+                except Exception as exc:
+                    log(f"faxina: cache: {exc}")
+    except Exception as exc:
+        try:
+            log(f"faxina: {exc}")
+        except Exception:
+            pass
+
+
 def cmd_limpar() -> int:
     """Arquiva branches revisor/* e apaga tentativas velhas."""
     topo = toplevel()
@@ -5273,6 +5775,20 @@ def cmd_limpar() -> int:
     else:
         print(f"revisor: 0 branch(es) arquivada(s); {removidas} tentativa(s) "
               "velha(s) removida(s)")
+    try:
+        cont_faxina = faxina_repo(topo)
+    except Exception as exc:
+        log(f"faxina: repo: {exc}")
+        cont_faxina = {"tentativas": 0, "estado": 0, "avisos": 0}
+    try:
+        cache_faxina = faxina_cache_global()
+    except Exception as exc:
+        log(f"faxina: cache: {exc}")
+        cache_faxina = 0
+    print(f"revisor: faxina: {cont_faxina.get('tentativas', 0)} tentativa(s), "
+          f"{cont_faxina.get('estado', 0)} arquivo(s), "
+          f"{cont_faxina.get('avisos', 0)} aviso(s), "
+          f"{cache_faxina} cache(s) removido(s)")
     return 0
 
 

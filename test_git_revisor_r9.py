@@ -23,12 +23,13 @@ _spec.loader.exec_module(mod)
 
 # ------------------------------------------------------------ montar_prompt
 
-def test_montar_prompt_intencao_divergencia_e_media() -> None:
-    """Regra de intenção (R12): divergência é MEDIA, com errata."""
+def test_montar_prompt_intencao_divergencia_e_baixa() -> None:
+    """Regra de intenção (R14): divergência é BAIXA, salvo segurança."""
     prompt = mod.montar_prompt("DIFFXYZ", "repo", "abc1234",
                                intencao="feat: faz algo")
-    assert "é problema MEDIA" in prompt
-    assert "problema BAIXA" not in prompt
+    assert "é problema BAIXA (não reprova)" in prompt
+    assert "só é ALTA se envolver segurança" in prompt
+    assert "é problema MEDIA" not in prompt
     assert "não reprove por isso" not in prompt
     assert "mensagem de um commit já feito não é corrigível" not in prompt
     assert "errata" in prompt
@@ -68,7 +69,7 @@ def revisao_isolada(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     prompts: list[str] = []
     monkeypatch.setattr(mod, "MAX_DIFF_BYTES", 500)
     monkeypatch.setattr(mod, "cache_parte_ativo", lambda topo=None: False)
-    monkeypatch.setattr(mod, "cfg", lambda chave, padrao: "1")
+    monkeypatch.setattr(mod, "cfg", lambda chave, padrao: padrao if chave == "maxPartes" else "1")
     monkeypatch.setattr(mod, "familia_revisor", lambda saida: "desconhecido")
 
     def fake_revisar(prompt: str, cwd: str) -> tuple[str, str]:

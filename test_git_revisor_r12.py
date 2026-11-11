@@ -140,12 +140,11 @@ def test_intencao_commits_errata_depois_do_corte(
 
 # -------------------------------------------------------------- montar_prompt
 
-def test_montar_prompt_regra_media_com_errata() -> None:
-    """Regra de divergência: MEDIA, errata cobre descrição, nunca bug."""
+def test_montar_prompt_regra_baixa_com_errata() -> None:
+    """Regra de divergência: BAIXA, errata cobre descrição, nunca bug."""
     prompt = mod.montar_prompt("DIFFXYZ", "repo", "abc1234",
                                intencao="feat: faz algo")
-    assert "MEDIA" in prompt
-    assert "é problema MEDIA" in prompt
+    assert "é problema BAIXA (não reprova)" in prompt
     assert "errata" in prompt
     assert "nunca justifica bug" in prompt
     assert "não reprove por isso" not in prompt
