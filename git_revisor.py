@@ -155,6 +155,10 @@ TEMPO_WORKER = 1800
 TEMPO_ESPERA_PUSH = 20 * 60
 TEMPO_ESPERA_CHECK = 30 * 60
 TEMPO_ESPERA_CHECK_RAPIDO = 5 * 60
+# pre-push em primeiro plano: fila de checks maior que isso segura o push com
+# retentativa em fundo (agente/terminal não fica preso atrás de outro build)
+TEMPO_ESPERA_CHECK_PUSH = 4 * 60
+_PUSH_PRIMEIRO_PLANO = False
 TEMPO_GIT = 60
 # push interno pode incluir revisão + checks do pre-push aninhado (ex.: Maven)
 TEMPO_PUSH_INTERNO = 45 * 60
@@ -416,6 +420,22 @@ def check_ocupado(relatorio: str) -> bool:
     return relatorio.startswith(
         (CHECK_OCUPADO, CHECK_SEM_RECURSO, CHECK_SEM_FERRAMENTA,
          CHECK_CEDIDO))
+
+
+def espera_checks() -> float:
+    """Segundos de espera pelo lock global de checks.
+
+    No pre-push em primeiro plano, `revisor.esperaChecksPush` (padrão
+    `TEMPO_ESPERA_CHECK_PUSH`); esgotada, o check devolve CHECK_OCUPADO e o
+    push é segurado com `retentar-push`. Em fundo, `TEMPO_ESPERA_CHECK`.
+    """
+    if not _PUSH_PRIMEIRO_PLANO:
+        return TEMPO_ESPERA_CHECK
+    try:
+        valor = float(cfg("esperaChecksPush", str(TEMPO_ESPERA_CHECK_PUSH)))
+    except ValueError:
+        valor = TEMPO_ESPERA_CHECK_PUSH
+    return min(TEMPO_ESPERA_CHECK, max(0.0, valor))
 
 
 def check_sem_ferramenta(relatorio: str) -> bool:
@@ -2484,11 +2504,11 @@ def _rodar_checks_selecionados(sha: str, topo: str,
                     "rodando completo")
                 efetivo = lista
             comandos.append((prefixo, efetivo, cwd_rel, eh_manual))
-        with trava(TEMPO_ESPERA_CHECK,
+        with trava(espera_checks(),
                    arquivo=arquivo_trava_checks()) as livre:
             if not livre:
                 ok, rel = False, (f"{CHECK_OCUPADO} por mais de "
-                                  f"{TEMPO_ESPERA_CHECK // 60} min")
+                                  f"{espera_checks() / 60:g} min")
                 log(rel)
             else:
                 kwargs = ({"arvore": arvore, "topo": topo}
@@ -2861,11 +2881,11 @@ def _rodar_checks_completos(
             return True, ""
         with worktree_checks(sha, topo) as tmp:
             pulos: list[str] = []
-            with trava(TEMPO_ESPERA_CHECK,
+            with trava(espera_checks(),
                        arquivo=arquivo_trava_checks()) as livre:
                 if not livre:
                     ok, rel = False, (f"{CHECK_OCUPADO} por mais de "
-                                      f"{TEMPO_ESPERA_CHECK // 60} min")
+                                      f"{espera_checks() / 60:g} min")
                     log(rel)
                 else:
                     kwargs = ({"arvore": arvore, "topo": topo}
@@ -2904,11 +2924,11 @@ def _rodar_checks_completos(
             return True, ""
         if arvore:
             _gravar_deteccao(arvore, checks)
-        with trava(TEMPO_ESPERA_CHECK,
+        with trava(espera_checks(),
                    arquivo=arquivo_trava_checks()) as livre:
             if not livre:
                 ok, rel = False, (f"{CHECK_OCUPADO} por mais de "
-                                  f"{TEMPO_ESPERA_CHECK // 60} min")
+                                  f"{espera_checks() / 60:g} min")
                 log(rel)
             else:
                 kwargs = ({"arvore": arvore, "topo": topo}
@@ -5823,6 +5843,9 @@ def cmd_hook(args: list[str]) -> int:
     if nome == "post-commit" and len(args) == 1:
         return hook_post_commit()
     if nome == "pre-push" and len(args) == 3:
+        global _PUSH_PRIMEIRO_PLANO
+        # push interno (retentativa/autopush) já roda em fundo: espera longa
+        _PUSH_PRIMEIRO_PLANO = os.environ.get("REVISOR_TRAVA_SEGURA") != "1"
         entrada = sys.stdin.read()
         return hook_pre_push(args[1], args[2], entrada)
     print(f"revisor: hook desconhecido: {' '.join(args)}", file=sys.stderr)

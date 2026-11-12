@@ -102,6 +102,34 @@ def test_rodar_checks_lock_ocupado_real(
 # ---------------------------------------------------------- check_ocupado
 
 
+def test_espera_checks_curta_so_no_push_em_primeiro_plano(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fundo espera TEMPO_ESPERA_CHECK; pre-push direto usa a espera curta."""
+    assert mod.espera_checks() == mod.TEMPO_ESPERA_CHECK
+    monkeypatch.setattr(mod, "_PUSH_PRIMEIRO_PLANO", True)
+    assert mod.espera_checks() == mod.TEMPO_ESPERA_CHECK_PUSH
+    _git(repo, "config", "revisor.esperaChecksPush", "lixo")
+    assert mod.espera_checks() == mod.TEMPO_ESPERA_CHECK_PUSH
+    _git(repo, "config", "revisor.esperaChecksPush", "999999")
+    assert mod.espera_checks() == mod.TEMPO_ESPERA_CHECK
+
+
+def test_push_primeiro_plano_lock_ocupado_nao_espera_30_min(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fila ocupada no pre-push direto devolve CHECK_OCUPADO na espera curta."""
+    monkeypatch.setattr(mod, "log", lambda *_a: None)
+    monkeypatch.setattr(mod, "_PUSH_PRIMEIRO_PLANO", True)
+    _git(repo, "config", "revisor.esperaChecksPush", "0.3")
+    _git(repo, "config", "revisor.check", "true")
+    sha = _commit(repo, {"app.py": "x = 1\n"}, "feat: app")
+    caminho = mod.arquivo_trava_checks()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    with caminho.open("w") as segura:
+        fcntl.flock(segura, fcntl.LOCK_EX)
+        ok, rel = mod.rodar_checks(sha, str(repo))
+    assert ok is False and mod.check_ocupado(rel)
+
+
 def test_check_ocupado_textos() -> None:
     """Só o prefixo CHECK_OCUPADO é ocupado; motivo tem texto próprio."""
     assert mod.check_ocupado(mod.CHECK_OCUPADO + " por mais de 30 min")
