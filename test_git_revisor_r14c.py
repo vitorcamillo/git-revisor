@@ -168,6 +168,21 @@ def test_cache_sem_git_removido(repo: Path) -> None:
     assert not pasta.exists()
 
 
+def test_cache_de_origem_apagada_sai_sem_esperar(repo: Path,
+                                                tmp_path: Path) -> None:
+    """Origem (worktree temporário) apagada remove o cache recente."""
+    _commit(repo, {"a.txt": "x\n"}, "feat")
+    pasta = mod.pasta_cache_repo()
+    _git(repo, "worktree", "add", "--detach", str(pasta / "wt"), "HEAD")
+    origem = tmp_path / "wt-temporario"
+    origem.mkdir()
+    (pasta / "origem").write_text(str(origem), encoding="utf-8")
+    assert mod.faxina_cache_global() == 0  # origem viva: fica
+    origem.rmdir()
+    assert mod.faxina_cache_global() >= 1
+    assert not pasta.exists()
+
+
 def test_cache_vivo_recente_mantido_velho_removido(repo: Path) -> None:
     """Cache vivo recente fica; envelhecido sai do worktree list do dono."""
     _commit(repo, {"a.txt": "x\n"}, "feat")

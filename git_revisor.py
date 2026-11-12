@@ -231,7 +231,8 @@ def pasta_cache_repo() -> Path:
 
     `nome` é o basename do toplevel reduzido a [A-Za-z0-9._-] (o resto
     vira `_`) e `hash` são 12 hex do git-common-dir, separando
-    repositórios homônimos e agrupando worktrees do mesmo repositório.
+    repositórios homônimos; cada worktree tem a própria pasta (o arquivo
+    `origem` guarda o toplevel para a faxina).
     """
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     nome = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(toplevel()))
@@ -1676,6 +1677,10 @@ def worktree_checks(sha: str, topo: str) -> Iterator[str]:
 
     cache = pasta_cache_repo()
     cache.mkdir(parents=True, exist_ok=True)
+    try:  # origem do cache: a faxina remove o cache quando ela some
+        (cache / "origem").write_text(topo, encoding="utf-8")
+    except OSError:
+        pass
     with trava(0, arquivo=cache / "wt.lock") as conseguiu:
         if not conseguiu:
             tmp = _temporario()
@@ -5615,7 +5620,17 @@ def faxina_cache_global() -> int:
                         tempos.append(fechadura.stat().st_mtime)
                 except OSError:
                     pass
-                if not tempos or max(tempos) >= corte:
+                # worktree de origem apagado (dono ainda existe: disco
+                # montado) não espera a retenção
+                origem_sumiu = False
+                try:
+                    origem = (pasta / "origem").read_text(
+                        encoding="utf-8").strip()
+                    origem_sumiu = (bool(origem) and alvo is not None
+                                    and not Path(origem).exists())
+                except OSError:
+                    pass
+                if not origem_sumiu and (not tempos or max(tempos) >= corte):
                     continue
             except Exception as exc:
                 log(f"faxina: cache {pasta}: {exc}")
@@ -5651,6 +5666,8 @@ def faxina_cache_global() -> int:
                         pass
                     if not wt.exists() and not wt.is_symlink():
                         removidas += 1
+                        if origem_sumiu:
+                            shutil.rmtree(pasta, ignore_errors=True)
             except Exception as exc:
                 log(f"faxina: cache {pasta}: {exc}")
         except Exception as exc:
