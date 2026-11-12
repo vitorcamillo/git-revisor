@@ -86,6 +86,18 @@ def test_falha_infra_forked_vm_e_killed() -> None:
     assert mod._falha_infra(1, "java.lang.OutOfMemoryError: Java heap") is False
 
 
+def test_falha_infra_docker_indisponivel() -> None:
+    """Testcontainers/CLI sem Docker é infra, não reprovação do código."""
+    saida = ("[ERROR] Errors:\n[ERROR]   WhatsAppEspelhoMySqlTest.start:34 » "
+             "IllegalState Could not find a valid Docker environment. Please "
+             "see logs and check configuration\n"
+             "[ERROR] Tests run: 9291, Failures: 0, Errors: 1, Skipped: 105\n")
+    assert mod._falha_infra(1, saida) is True
+    assert mod._falha_infra(1, "Cannot connect to the Docker daemon at "
+                               "unix:///var/run/docker.sock.") is True
+    assert mod._falha_infra(1, "AssertionError: docker label errado") is False
+
+
 # ------------------------------------------------------------ _executar_checks
 
 def _checks_fake(monkeypatch: pytest.MonkeyPatch, codigos: list[tuple[int, str]],

@@ -440,11 +440,14 @@ def _veredito_de_pulo(relatorio: str) -> str:
     return "CHECK_OCUPADO"
 
 
-# marcadores de morte do processo por infraestrutura (saída de check);
-# OutOfMemoryError de TESTE não casa com nenhum deles
+# marcadores de falha por infraestrutura (saída de check): JVM morta ou
+# Docker indisponível (Testcontainers / CLI); OutOfMemoryError de TESTE
+# não casa com nenhum deles
 _MARCADORES_INFRA = (
     "The forked VM terminated without properly saying goodbye",
     "ExecutionException The forked VM terminated",
+    "Could not find a valid Docker environment",
+    "Cannot connect to the Docker daemon",
 )
 
 
@@ -453,7 +456,8 @@ def _falha_infra(returncode: int, saida: str) -> bool:
 
     Códigos 75 (indisponível), 137 (SIGKILL/OOM), 143 (SIGTERM) ou
     negativo (morto por sinal), ou saída com marcador inequívoco de JVM
-    morta ou `Killed` como linha inteira (últimas ~80 linhas).
+    morta, Docker indisponível ou `Killed` como linha inteira (últimas ~80
+    linhas).
     """
     if returncode in (75, 137, 143) or returncode < 0:
         return True
