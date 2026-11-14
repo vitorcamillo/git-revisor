@@ -154,7 +154,10 @@ TEMPO_REVISOR = 1500
 TEMPO_WORKER = 1800
 TEMPO_ESPERA_PUSH = 20 * 60
 TEMPO_ESPERA_CHECK = 30 * 60
-TEMPO_ESPERA_CHECK_RAPIDO = 5 * 60
+# check rápido é só filtro antes da IA: espera curta cobre outro check leve
+# (segundos); atrás de suíte longa de outro repositório, pula em vez de
+# gastar minutos e ser pulado do mesmo jeito
+TEMPO_ESPERA_CHECK_RAPIDO = 20
 # pre-push em primeiro plano: fila de checks maior que isso segura o push com
 # retentativa em fundo (agente/terminal não fica preso atrás de outro build)
 TEMPO_ESPERA_CHECK_PUSH = 4 * 60
