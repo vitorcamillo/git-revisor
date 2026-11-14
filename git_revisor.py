@@ -607,6 +607,27 @@ def arquivo_trava_checks() -> Path:
     return estado / "git-revisor" / "checks.lock"
 
 
+@contextmanager
+def trava_checks(cede: bool = False) -> Iterator[bool]:
+    """Lock global de checks, com espera de `espera_checks()`.
+
+    Quem não cede a vez (check de push ou de correção) deixa o aviso
+    global enquanto espera, e a suíte completa em fundo de qualquer
+    repositório solta o lock. `cede=True` (a própria suíte) não avisa:
+    suítes em fundo não se interrompem entre si.
+    """
+    aviso = None if cede else marcar_check_esperando()
+    try:
+        with trava(espera_checks(), arquivo=arquivo_trava_checks()) as livre:
+            if aviso is not None:
+                _apagar_aviso(aviso)
+                aviso = None
+            yield livre
+    finally:
+        if aviso is not None:
+            _apagar_aviso(aviso)
+
+
 COTA_ESPERA_PADRAO_S = 600
 COTA_ESPERA_MAX_S = 24 * 3600
 _COTA_RESET_RE = re.compile(r"worker-ask-quota-reset:\s*(\d+)")
@@ -778,14 +799,44 @@ def _aviso_expirado(arq: Path, inicio_gravado: str) -> bool:
 
 
 def push_esperando() -> bool:
-    """True se há um push vivo esperando a fila de revisão.
+    """True se há um push vivo esperando a fila de revisão deste repositório."""
+    return _aviso_vivo(pasta_push_esperando())
+
+
+def pasta_checks_esperando() -> Path:
+    """Pasta GLOBAL dos avisos de push esperando o lock de checks."""
+    return arquivo_trava_checks().parent / "checks-esperando"
+
+
+def marcar_check_esperando() -> Path | None:
+    """Avisa todos os repositórios que este processo espera o lock de checks."""
+    try:
+        pasta = pasta_checks_esperando()
+        pasta.mkdir(parents=True, exist_ok=True)
+        caminho = pasta / str(os.getpid())
+        caminho.write_text(inicio_processo(os.getpid()) or "", encoding="utf-8")
+        return caminho
+    except OSError:
+        return None
+
+
+def alguem_esperando() -> bool:
+    """True com push esperando aqui ou check de push esperando em qualquer repo.
+
+    É o `abortar` da suíte completa em fundo: ela cede o lock global de
+    checks também a push de OUTRO repositório.
+    """
+    return push_esperando() or _aviso_vivo(pasta_checks_esperando())
+
+
+def _aviso_vivo(pasta: Path) -> bool:
+    """True se `pasta` tem aviso (arquivo `<pid>`) de processo vivo.
 
     Arquivo com pid morto (ProcessLookupError) ou nome não numérico é lixo
     de um push que morreu sem limpar: apagado na hora. Pid vivo só conta
     se o aviso não estiver expirado (pid reciclado ou aviso velho demais);
     PermissionError (processo de outro usuário) segue a mesma checagem.
     """
-    pasta = pasta_push_esperando()
     if not pasta.exists():
         return False
     for arq in sorted(pasta.iterdir()):
@@ -2507,8 +2558,7 @@ def _rodar_checks_selecionados(sha: str, topo: str,
                     "rodando completo")
                 efetivo = lista
             comandos.append((prefixo, efetivo, cwd_rel, eh_manual))
-        with trava(espera_checks(),
-                   arquivo=arquivo_trava_checks()) as livre:
+        with trava_checks() as livre:
             if not livre:
                 ok, rel = False, (f"{CHECK_OCUPADO} por mais de "
                                   f"{espera_checks() / 60:g} min")
@@ -2884,8 +2934,7 @@ def _rodar_checks_completos(
             return True, ""
         with worktree_checks(sha, topo) as tmp:
             pulos: list[str] = []
-            with trava(espera_checks(),
-                       arquivo=arquivo_trava_checks()) as livre:
+            with trava_checks(cede=abortar is not None) as livre:
                 if not livre:
                     ok, rel = False, (f"{CHECK_OCUPADO} por mais de "
                                       f"{espera_checks() / 60:g} min")
@@ -2927,8 +2976,7 @@ def _rodar_checks_completos(
             return True, ""
         if arvore:
             _gravar_deteccao(arvore, checks)
-        with trava(espera_checks(),
-                   arquivo=arquivo_trava_checks()) as livre:
+        with trava_checks(cede=abortar is not None) as livre:
             if not livre:
                 ok, rel = False, (f"{CHECK_OCUPADO} por mais de "
                                   f"{espera_checks() / 60:g} min")
@@ -5324,6 +5372,7 @@ def cmd_retentar_push(sha_curto: str) -> int:
         horas = 6.0
     fim = time.monotonic() + horas * 3600
     seguradas = 0
+    aviso_global = marcar_check_esperando()
     try:
         while True:
             # prazo conferido antes de cada volta: um push segurado pode
@@ -5380,6 +5429,8 @@ def cmd_retentar_push(sha_curto: str) -> int:
             caminho.unlink()
         except OSError:
             pass
+        if aviso_global is not None:
+            _apagar_aviso(aviso_global)
 
 
 def cmd_suite_completa(sha_curto: str) -> int:
@@ -5389,8 +5440,8 @@ def cmd_suite_completa(sha_curto: str) -> int:
     push esperando e o lock de checks livre, até `revisor.retentarMaxH`
     horas. Roda os checks completos (nunca selecionados) com
     `rodar_checks(..., forcar_completo=True)`, cedendo a vez a um push
-    que aparecer (`abortar=push_esperando`): infra/ocupado/cedido volta a
-    esperar dentro do prazo; esgotou, notifica sem marcar falha.
+    que aparecer (`abortar=alguem_esperando`, de qualquer repositório):
+    infra/ocupado/cedido volta a esperar dentro do prazo; esgotou, notifica sem marcar falha.
     Ferramenta ausente notifica e encerra sem marcar falha (o push já
     teria bloqueado por isso). Falha real grava `suite-falhou.json` e
     notifica — o próximo push roda o completo até ficar verde. Verde
@@ -5423,12 +5474,12 @@ def cmd_suite_completa(sha_curto: str) -> int:
             mb = mem_disponivel_mb()
             if not ((mb is None or mb >= mem_minima_mb())
                     and not lock_checks_ocupado()
-                    and not push_esperando()):
+                    and not alguem_esperando()):
                 time.sleep(60)
                 continue
             ok, rel = rodar_checks(sha, topo, base=base,
                                    forcar_completo=True,
-                                   abortar=push_esperando)
+                                   abortar=alguem_esperando)
             if ok:
                 log(f"suíte completa verde em {sha7(sha)}")
                 _apagar_falha_ancestral(sha, topo)
