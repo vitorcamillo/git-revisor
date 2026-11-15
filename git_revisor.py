@@ -4261,7 +4261,35 @@ def familia_do_comando(cmd: list[str]) -> str | None:
     return None
 
 
+def _repos_vigiados(cwd: str) -> list[str]:
+    """Repos fora de `cwd` que o worker alcança: principal, revisor e links de ~/.local/bin."""
+    alvos = {Path(__file__).resolve().parent}
+    comum = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd)
+    if comum.returncode == 0:
+        alvos.add(Path(comum.stdout.strip()).parent)
+    binarios = Path.home() / ".local" / "bin"
+    alvos |= {ln.resolve().parent for ln in (binarios.iterdir() if binarios.is_dir() else []) if ln.is_symlink()}
+    topos = {git(["rev-parse", "--show-toplevel"], cwd=str(a)).stdout.strip() for a in alvos if a.is_dir()}
+    return sorted(t for t in topos if t and Path(t).resolve() != Path(cwd).resolve())
+
+
 def rodar_worker(tarefa: str, cwd: str) -> str | None:
+    """Cadeia de workers com guarda: o que ele mudar em outro repo é desfeito (patch guardado)."""
+    alterados = lambda repo: set(git(["diff", "--name-only", "HEAD"], cwd=repo).stdout.split())  # noqa: E731
+    vigiados = {repo: alterados(repo) for repo in _repos_vigiados(cwd)}
+    try:
+        return _rodar_cadeia(tarefa + f"\n\nEdite só arquivos dentro de {cwd}; nada fora dele, nem por links.", cwd)
+    finally:
+        for repo, antes in vigiados.items():
+            if novos := sorted(alterados(repo) - antes):
+                patch = arquivo_trava_checks().parent / "fora-do-escopo" / f"{int(time.time())}-{Path(repo).name}.patch"
+                patch.parent.mkdir(parents=True, exist_ok=True)
+                patch.write_text(git(["diff", "HEAD", "--", *novos], cwd=repo).stdout, encoding="utf-8")
+                git(["checkout", "HEAD", "--", *novos], cwd=repo)
+                log(f"worker alterou {repo} fora da correção ({', '.join(novos)[:200]}): desfeito; patch em {patch}")
+
+
+def _rodar_cadeia(tarefa: str, cwd: str) -> str | None:
     """Roda o worker em cadeia (GLM → Muse → Luna → Haiku); devolve a família
     do degrau que deu certo ("glm", "muse", "codex" ou "claude"), ou None se
     todos falharem. A família vem do NOME do comando quando ele revela
