@@ -48,7 +48,7 @@ def test_worker_fora_do_escopo_preservado_e_avisado(tmp_path, monkeypatch) -> No
     assert avisos and "a.txt" in avisos[0][1]
 
 
-def test_worker_arquivo_novo_movido_para_fora_do_escopo(tmp_path, monkeypatch) -> None:
+def test_worker_arquivo_novo_preservado_e_avisado(tmp_path, monkeypatch) -> None:
     outro = _repo(tmp_path)
     avisos = _avisos(monkeypatch)
     monkeypatch.setattr(mod, "_repos_vigiados", lambda cwd: [str(outro)])
@@ -59,10 +59,8 @@ def test_worker_arquivo_novo_movido_para_fora_do_escopo(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(mod, "_rodar_cadeia", cadeia)
     assert mod.rodar_worker("tarefa", str(tmp_path)) == "glm"
-    assert not (outro / "novo_modulo.py").exists()
-    movidos = list((tmp_path / "state" / "git-revisor" / "fora-do-escopo").rglob("novo_modulo.py"))
-    assert len(movidos) == 1 and movidos[0].read_text() == "novo\n"
-    assert avisos
+    assert (outro / "novo_modulo.py").read_text() == "novo\n"
+    assert avisos and "novo_modulo.py" in avisos[0][1]
 
 
 def test_edicao_concorrente_de_terceiro_preservada(tmp_path, monkeypatch) -> None:

@@ -4281,9 +4281,8 @@ def rodar_worker(tarefa: str, cwd: str) -> str | None:
     usuário trabalha e a correção roda em fundo: arquivo rastreado
     alterado nunca é desfeito às cegas (edição concorrente seria
     perdida) — o diff vai para `fora-do-escopo` e `notificar()` avisa,
-    preservando o conteúdo no lugar. Arquivo novo não rastreado é
-    movido para `fora-do-escopo` (nunca apagado), com rechecagem do
-    hash logo antes de mover: se mudou, fica no lugar e só avisa.
+    preservando o conteúdo no lugar. Arquivo novo não rastreado também
+    fica no lugar e só é avisado (o usuário pode tê-lo criado agora).
     """
     ausente = object()
 
@@ -4320,7 +4319,7 @@ def rodar_worker(tarefa: str, cwd: str) -> str | None:
             pasta = arquivo_trava_checks().parent / "fora-do-escopo"
             pasta.mkdir(parents=True, exist_ok=True)
             carimbo = int(time.time())
-            avisados = rastreados + editados_novos
+            avisados = rastreados + editados_novos + novos
             if avisados:
                 detalhe = ""
                 if rastreados:
@@ -4333,35 +4332,6 @@ def rodar_worker(tarefa: str, cwd: str) -> str | None:
                     "Worker fora do escopo",
                     f"alteração preservada sem desfazer em {repo} "
                     f"({', '.join(avisados)[:200]}){detalhe}")
-            if novos:
-                destino_base = pasta / f"{carimbo}-{Path(repo).name}"
-                movidos: list[str] = []
-                preservados: list[str] = []
-                for nome in novos:
-                    # hash mudou desde a foto (edição concorrente) ou
-                    # caminho suspeito: não move, só avisa abaixo
-                    if (_hash(repo, nome) != depois_n[nome]
-                            or Path(nome).is_absolute()
-                            or ".." in Path(nome).parts):
-                        preservados.append(nome)
-                        continue
-                    destino = destino_base / nome
-                    try:
-                        destino.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(Path(repo) / nome), str(destino))
-                        movidos.append(nome)
-                    except OSError:
-                        preservados.append(nome)
-                if movidos:
-                    notificar(
-                        "Worker fora do escopo",
-                        f"arquivos novos movidos de {repo} para "
-                        f"{destino_base}: {', '.join(movidos)[:200]}")
-                if preservados:
-                    notificar(
-                        "Worker fora do escopo",
-                        f"arquivos novos preservados em {repo} "
-                        f"({', '.join(preservados)[:200]})")
 
 
 def _rodar_cadeia(tarefa: str, cwd: str) -> str | None:
