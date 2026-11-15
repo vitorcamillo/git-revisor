@@ -4274,19 +4274,94 @@ def _repos_vigiados(cwd: str) -> list[str]:
 
 
 def rodar_worker(tarefa: str, cwd: str) -> str | None:
-    """Cadeia de workers com guarda: o que ele mudar em outro repo é desfeito (patch guardado)."""
-    alterados = lambda repo: set(git(["diff", "--name-only", "HEAD"], cwd=repo).stdout.split())  # noqa: E731
-    vigiados = {repo: alterados(repo) for repo in _repos_vigiados(cwd)}
+    """Cadeia de workers com guarda de escopo nos repos vigiados.
+
+    A foto é por hash de conteúdo (`-z`, sem quebrar nomes com espaço ou
+    acento), incluindo arquivos não rastreados. Repo vigiado é onde o
+    usuário trabalha e a correção roda em fundo: arquivo rastreado
+    alterado nunca é desfeito às cegas (edição concorrente seria
+    perdida) — o diff vai para `fora-do-escopo` e `notificar()` avisa,
+    preservando o conteúdo no lugar. Arquivo novo não rastreado é
+    movido para `fora-do-escopo` (nunca apagado), com rechecagem do
+    hash logo antes de mover: se mudou, fica no lugar e só avisa.
+    """
+    ausente = object()
+
+    def _nomes(repo: str, args: list[str]) -> list[str]:
+        return [n for n in git(args, cwd=repo).stdout.split("\0") if n]
+
+    def _hash(repo: str, caminho: str) -> str | None:
+        p = git(["hash-object", "--", caminho], cwd=repo)
+        return p.stdout.strip() if p.returncode == 0 else None
+
+    def _foto(repo: str) -> tuple[dict[str, str | None], dict[str, str | None]]:
+        rastreados = {n: _hash(repo, n)
+                      for n in _nomes(repo, ["diff", "--name-only", "-z", "HEAD"])}
+        novos = {n: _hash(repo, n)
+                 for n in _nomes(repo, ["ls-files", "--others",
+                                        "--exclude-standard", "-z"])}
+        return rastreados, novos
+
+    vigiados = {repo: _foto(repo) for repo in _repos_vigiados(cwd)}
     try:
         return _rodar_cadeia(tarefa + f"\n\nEdite só arquivos dentro de {cwd}; nada fora dele, nem por links.", cwd)
     finally:
-        for repo, antes in vigiados.items():
-            if novos := sorted(alterados(repo) - antes):
-                patch = arquivo_trava_checks().parent / "fora-do-escopo" / f"{int(time.time())}-{Path(repo).name}.patch"
-                patch.parent.mkdir(parents=True, exist_ok=True)
-                patch.write_text(git(["diff", "HEAD", "--", *novos], cwd=repo).stdout, encoding="utf-8")
-                git(["checkout", "HEAD", "--", *novos], cwd=repo)
-                log(f"worker alterou {repo} fora da correção ({', '.join(novos)[:200]}): desfeito; patch em {patch}")
+        for repo, (antes_r, antes_n) in vigiados.items():
+            depois_r, depois_n = _foto(repo)
+            rastreados = sorted(
+                p for p in set(antes_r) | set(depois_r)
+                if antes_r.get(p, ausente) != depois_r.get(p, ausente))
+            editados_novos = sorted(
+                p for p in depois_n
+                if p in antes_n and antes_n[p] != depois_n[p])
+            novos = sorted(p for p in depois_n if p not in antes_n)
+            if not rastreados and not editados_novos and not novos:
+                continue
+            pasta = arquivo_trava_checks().parent / "fora-do-escopo"
+            pasta.mkdir(parents=True, exist_ok=True)
+            carimbo = int(time.time())
+            avisados = rastreados + editados_novos
+            if avisados:
+                detalhe = ""
+                if rastreados:
+                    patch = pasta / f"{carimbo}-{Path(repo).name}.patch"
+                    patch.write_text(
+                        git(["diff", "HEAD", "--", *rastreados],
+                            cwd=repo).stdout, encoding="utf-8")
+                    detalhe = f"; patch em {patch}"
+                notificar(
+                    "Worker fora do escopo",
+                    f"alteração preservada sem desfazer em {repo} "
+                    f"({', '.join(avisados)[:200]}){detalhe}")
+            if novos:
+                destino_base = pasta / f"{carimbo}-{Path(repo).name}"
+                movidos: list[str] = []
+                preservados: list[str] = []
+                for nome in novos:
+                    # hash mudou desde a foto (edição concorrente) ou
+                    # caminho suspeito: não move, só avisa abaixo
+                    if (_hash(repo, nome) != depois_n[nome]
+                            or Path(nome).is_absolute()
+                            or ".." in Path(nome).parts):
+                        preservados.append(nome)
+                        continue
+                    destino = destino_base / nome
+                    try:
+                        destino.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(Path(repo) / nome), str(destino))
+                        movidos.append(nome)
+                    except OSError:
+                        preservados.append(nome)
+                if movidos:
+                    notificar(
+                        "Worker fora do escopo",
+                        f"arquivos novos movidos de {repo} para "
+                        f"{destino_base}: {', '.join(movidos)[:200]}")
+                if preservados:
+                    notificar(
+                        "Worker fora do escopo",
+                        f"arquivos novos preservados em {repo} "
+                        f"({', '.join(preservados)[:200]})")
 
 
 def _rodar_cadeia(tarefa: str, cwd: str) -> str | None:
