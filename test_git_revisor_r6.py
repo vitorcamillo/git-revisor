@@ -181,7 +181,8 @@ def test_intervalo_risco_baixo_ocupado_bloqueia_sem_salvar(
     assert mod.ler_relatorio(sha) is None
     saida = capsys.readouterr().out
     assert ("push segurado: os testes não puderam rodar agora" in saida
-            and "vou tentar de novo sozinho" in saida)
+            and "NÃO foi agendada" in saida
+            and "vou tentar de novo sozinho" not in saida)
 
 
 def test_intervalo_pos_ia_ocupado_bloqueia_sem_salvar(
@@ -204,7 +205,8 @@ def test_intervalo_pos_ia_ocupado_bloqueia_sem_salvar(
     assert mod.ler_relatorio(sha) is None
     saida = capsys.readouterr().out
     assert ("push segurado: os testes não puderam rodar agora" in saida
-            and "vou tentar de novo sozinho" in saida)
+            and "NÃO foi agendada" in saida
+            and "vou tentar de novo sozinho" not in saida)
 
 
 # ---------------------------------------------------------- revisar_com_trava

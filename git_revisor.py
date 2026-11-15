@@ -405,6 +405,12 @@ CHECK_CEDIDO = "check interrompido: push esperando"
 # impresso pelo hook quando o push é segurado por lock/infra (retentável);
 # retentar-push reconhece uma retentativa segurada DE NOVO por esse texto
 MARCADOR_PUSH_SEGURADO = "push segurado: os testes não puderam rodar agora"
+# impresso só quando o retentar-push foi agendado de fato (quem automatiza o
+# push, como o guardião do JARVIS, distingue "segurado e agendado" por ele)
+MARCADOR_RETENTATIVA_AGENDADA = "vou tentar de novo sozinho"
+# ref que segura o commit de um push em HEAD destacado até o retentar-push
+# terminar (a cópia de trabalho pode sumir antes)
+PREFIXO_REF_RETENTAR = "refs/revisor/retentar/"
 # teto de "segurado de novo" seguidos no retentar-push (além do prazo)
 MAX_SEGURADAS_RETENTAR = 10
 # espera por memória na repetição estrita SEM `abortar` (check final do
@@ -3500,6 +3506,21 @@ def resolver_ref_local(local_ref: str | None, local_sha: str,
     return nome
 
 
+def pasta_principal(topo: str) -> str:
+    """Worktree principal do repositório de `topo` (ou o próprio `topo`).
+
+    Um worktree vinculado (cópia descartável, como a do guardião) pode ser
+    apagado antes do retentar-push rodar; a pasta principal sobrevive e vê
+    as mesmas branches e objetos. Repositório bare ou erro: `topo`.
+    """
+    p = git(["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=topo)
+    comum = Path(p.stdout.strip()) if p.returncode == 0 else None
+    if comum is None or comum.name != ".git" or not comum.parent.is_dir():
+        return topo
+    return str(comum.parent)
+
+
 def correcao_push_fundo() -> bool:
     """True se a correção do push roda em segundo plano (padrão)."""
     return cfg("correcaoPush", "fundo").strip().lower() != "frente"
@@ -3612,8 +3633,18 @@ def disparar_retentar_push(local_sha: str, remote: str, remote_ref: str,
 
     Grava o pedido em retentar-push/<local_sha>.json e dispara
     `retentar-push <local_sha>` desacoplado, heritando o ambiente do push
-    original. Se já houver pedido com processo vivo, não dispara de novo.
+    original, a partir do worktree principal. Se já houver pedido com
+    processo vivo, não dispara de novo. `local_ref == local_sha` é push de
+    HEAD destacado: o commit fica preso em `PREFIXO_REF_RETENTAR<sha>`.
     """
+    principal = pasta_principal(topo)
+    if local_ref == local_sha:
+        p = git(["update-ref", f"{PREFIXO_REF_RETENTAR}{local_sha}", local_sha],
+                cwd=principal)
+        if p.returncode != 0:
+            log(f"retentar-push: não consegui segurar {sha7(local_sha)}: "
+                f"{p.stderr.strip()[:200]}")
+            return False
     pasta = base_dir() / "retentar-push"
     try:
         pasta.mkdir(parents=True, exist_ok=True)
@@ -3656,7 +3687,7 @@ def disparar_retentar_push(local_sha: str, remote: str, remote_ref: str,
             [sys.executable, str(Path(__file__).resolve()),
              "retentar-push", local_sha],
             start_new_session=True, stdin=subprocess.DEVNULL,
-            stdout=arq_log, stderr=arq_log, cwd=topo)
+            stdout=arq_log, stderr=arq_log, cwd=principal)
     except OSError as exc:
         log(f"retentar-push: não consegui disparar: {exc}")
         return False
@@ -3735,9 +3766,10 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
         """Check não rodou (lock/infra/ferramenta): segura o push sem reprovar.
 
         Retentável (lock ou recurso) com branch local e remoto conhecidos:
-        dispara `retentar-push` em segundo plano. Ferramenta ausente: sem
-        retentativa, pede instalação. Sem remote/local_ref (push interno,
-        HEAD destacado): só segura, com notificação.
+        dispara `retentar-push` em segundo plano; HEAD destacado retenta
+        pelo sha. Ferramenta ausente: sem retentativa, pede instalação. Sem
+        remote/remote_ref (push interno) ou disparo que falhou: só segura,
+        dizendo que não haverá retentativa, e notifica.
         """
         if check_sem_ferramenta(relatorio):
             msg = (f"push segurado: falta ferramenta para testar "
@@ -3745,15 +3777,21 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
             print(f"revisor: {msg}")
             notificar("Push segurado", msg)
             return 1
-        msg = (f"{MARCADOR_PUSH_SEGURADO}; vou tentar de novo sozinho assim "
-               "que a máquina liberar (git revisor status). Não precisa "
-               "fazer nada.")
         disparou = False
-        if remote and remote_ref and local_ref:
-            ref_ok = resolver_ref_local(local_ref, local_sha, topo)
-            if ref_ok is not None:
-                disparou = disparar_retentar_push(local_sha, remote,
-                                                  remote_ref, ref_ok, topo)
+        if remote and remote_ref:
+            # HEAD destacado/sha solto: retenta pelo sha (sem branch a seguir)
+            ref_ok = (resolver_ref_local(local_ref, local_sha, topo)
+                      if local_ref else None) or local_sha
+            disparou = disparar_retentar_push(local_sha, remote, remote_ref,
+                                              ref_ok, topo)
+        if disparou:
+            msg = (f"{MARCADOR_PUSH_SEGURADO}; {MARCADOR_RETENTATIVA_AGENDADA} "
+                   "assim que a máquina liberar (git revisor status). Não "
+                   "precisa fazer nada.")
+        else:
+            msg = (f"{MARCADOR_PUSH_SEGURADO}; a retentativa automática NÃO "
+                   "foi agendada: rode git push de novo quando a máquina "
+                   "liberar.")
         print(f"revisor: {relatorio.strip()}")
         print(msg)
         if not disparou:
@@ -5437,6 +5475,9 @@ def cmd_retentar_push(sha_curto: str) -> int:
             pass
         return 1
     topo = toplevel()
+    # pedido de HEAD destacado: local_ref é o próprio sha (não há branch
+    # que possa andar); o commit está preso em PREFIXO_REF_RETENTAR<sha>
+    destacado = local_ref == sha
     try:
         horas = float(cfg("retentarMaxH", "6"))
     except ValueError:
@@ -5455,8 +5496,14 @@ def cmd_retentar_push(sha_curto: str) -> int:
                           f"{sha7(sha)}: a máquina não liberou em {horas:g} h; "
                           "rode git push de novo quando puder")
                 return 1
-            p_ref = git(["rev-parse", local_ref], cwd=topo)
+            p_ref = git(["rev-parse", "-q", "--verify",
+                         f"{local_ref}^{{commit}}"], cwd=topo)
             if p_ref.returncode != 0 or p_ref.stdout.strip() != sha:
+                if destacado:
+                    notificar("Push ainda bloqueado",
+                              f"{sha7(sha)}: o commit sumiu do repositório; "
+                              "sem retentativa")
+                    return 1
                 log("retentar-push: branch andou; o próximo push cobre")
                 return 0
             mb = mem_disponivel_mb()
@@ -5502,6 +5549,8 @@ def cmd_retentar_push(sha_curto: str) -> int:
             caminho.unlink()
         except OSError:
             pass
+        if destacado:
+            git(["update-ref", "-d", f"{PREFIXO_REF_RETENTAR}{sha}"], cwd=topo)
         if aviso_global is not None:
             _apagar_aviso(aviso_global)
 
