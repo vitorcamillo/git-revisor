@@ -66,7 +66,17 @@ IA APROVADO ou retomada) e o check rápido — `revisor.checkRapido`
 (padrão `true`; `false` desliga) com comando forçado por
 `revisor.checkRapidoCmd` (mesmo formato `@<pasta> cmd` de `revisor.check`)
 — roda antes da IA como filtro: se falhar, o commit é reprovado com o
-relatório do check sem chamar a IA.
+relatório do check sem chamar a IA. O check rápido com pytest ignora os
+testes pesados de `revisor.rapidoIgnorar` (vários valores; globs casados
+com o caminho relativo ou o basename, ex.: `tests/tv/*`, `*_browser.py`):
+teste que casa sai da seleção e, se só restar teste pesado, o rápido roda
+`pytest --collect-only` (só importa, sem executar o navegador).
+
+Os checks rodam com vagas de lock (`revisor.vagasChecks`, padrão `1`,
+máximo 8; piso de carga `revisor.cargaMaxima`, padrão `1.5` por CPU): a
+vaga 0 é o lock único de antes e as vagas extras só são usadas com carga
+(`os.getloadavg()[0]` por CPU dentro do limite) e memória
+(`revisor.memMinimaMb`) folgadas.
 
 Check final selecionado: `revisor.checkFinal` escolhe entre `completo`
 (padrão) e `selecionado`. Com `selecionado`, o check final (que aprova
@@ -543,23 +553,24 @@ def esperar_memoria(limite_s: int = 600,
 
 
 def lock_checks_ocupado() -> bool:
-    """True se alguém está com o lock de checks AGORA (testa, não pega)."""
-    try:
-        caminho = arquivo_trava_checks()
-        caminho.parent.mkdir(parents=True, exist_ok=True)
-        arq = caminho.open("w")
-    except (OSError, RuntimeError):
-        return False
-    try:
-        fcntl.flock(arq, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(arq, fcntl.LOCK_UN)
-        return False
-    except BlockingIOError:
-        return True
-    except OSError:
-        return False
-    finally:
-        arq.close()
+    """True se TODAS as vagas de checks estão ocupadas AGORA (testa, não pega)."""
+    for caminho in arquivos_vagas_checks():
+        try:
+            caminho.parent.mkdir(parents=True, exist_ok=True)
+            arq = caminho.open("w")
+        except (OSError, RuntimeError):
+            return False
+        try:
+            fcntl.flock(arq, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(arq, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            pass
+        except OSError:
+            return False
+        finally:
+            arq.close()
+    return True
 
 
 # ------------------------------------------------------------------- lock
@@ -613,9 +624,103 @@ def arquivo_trava_checks() -> Path:
     return estado / "git-revisor" / "checks.lock"
 
 
+def vagas_checks() -> int:
+    """Número de vagas do lock de checks (`revisor.vagasChecks`, 1 a 8).
+
+    Padrão 1 (o lock único de antes); valor inválido usa 1.
+    """
+    try:
+        valor = int(cfg("vagasChecks", "1"))
+    except ValueError:
+        return 1
+    return max(1, min(8, valor))
+
+
+def arquivos_vagas_checks() -> list[Path]:
+    """Arquivos das vagas do lock de checks (vaga 0 é `arquivo_trava_checks()`)."""
+    base = arquivo_trava_checks()
+    return [base if i == 0 else base.with_name(f"{base.name}.{i}")
+            for i in range(vagas_checks())]
+
+
+def carga_ok() -> bool:
+    """True se a carga por CPU está dentro de `revisor.cargaMaxima` (1.5).
+
+    Sem medição possível (OSError/AttributeError) devolve True; limite
+    inválido usa 1.5.
+    """
+    try:
+        limite = float(cfg("cargaMaxima", "1.5"))
+    except ValueError:
+        limite = 1.5
+    try:
+        carga1, _, _ = os.getloadavg()
+    except (OSError, AttributeError):
+        return True
+    return carga1 / (os.cpu_count() or 1) <= limite
+
+
+@contextmanager
+def trava_vaga_checks(timeout_s: float | None) -> Iterator[bool]:
+    """Segura uma vaga do lock de checks; devolve True se conseguiu.
+
+    A vaga 0 é o lock único de antes e tenta primeiro; as vagas extras só
+    são tentadas com carga (`carga_ok()`) e memória (`mem_disponivel_mb()`
+    é None ou >= `mem_minima_mb()`) folgadas. `timeout_s=None` espera
+    indefinidamente; 0 tenta uma vez; >0 espera até o limite, sondando a
+    cada 0.2 s. Com uma vaga só, equivale a `trava` no arquivo da vaga 0.
+    """
+    vagas = arquivos_vagas_checks()
+    if len(vagas) == 1:
+        with trava(timeout_s, arquivo=vagas[0]) as livre:
+            yield livre
+        return
+    for caminho in vagas:
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+    abertos = [caminho.open("w") for caminho in vagas]
+    ok = False
+    dono = None
+    try:
+        fim = None if timeout_s is None else time.monotonic() + timeout_s
+        while True:
+            extras = False
+            if carga_ok():
+                restante = mem_disponivel_mb()
+                extras = restante is None or restante >= mem_minima_mb()
+            for indice, arq in enumerate(abertos):
+                if indice >= 1 and not extras:
+                    continue
+                try:
+                    fcntl.flock(arq, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    continue
+                ok = True
+                dono = arq
+                break
+            if ok:
+                break
+            if fim is not None and time.monotonic() >= fim:
+                break
+            time.sleep(0.2)
+        yield ok
+    finally:
+        if dono is not None:
+            try:
+                fcntl.flock(dono, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        for arq in abertos:
+            try:
+                arq.close()
+            except OSError:
+                pass
+
+
 @contextmanager
 def trava_checks(cede: bool = False) -> Iterator[bool]:
-    """Lock global de checks, com espera de `espera_checks()`.
+    """Uma vaga do lock de checks, com espera de `espera_checks()`.
 
     Quem não cede a vez (check de push ou de correção) deixa o aviso
     global enquanto espera, e a suíte completa em fundo de qualquer
@@ -624,7 +729,7 @@ def trava_checks(cede: bool = False) -> Iterator[bool]:
     """
     aviso = None if cede else marcar_check_esperando()
     try:
-        with trava(espera_checks(), arquivo=arquivo_trava_checks()) as livre:
+        with trava_vaga_checks(espera_checks()) as livre:
             if aviso is not None:
                 _apagar_aviso(aviso)
                 aviso = None
@@ -1930,9 +2035,27 @@ _MVN_ARGS_SIMPLES = frozenset(
 _PYTEST_ARGS_SIMPLES = frozenset({"-q", "-x", "--quiet"})
 
 
+def padroes_rapido_ignorar(topo: str | None = None) -> list[str]:
+    """Globs de testes pesados que o check rápido com pytest ignora.
+
+    Lê `revisor.rapidoIgnorar` (vários valores, ex.: `tests/tv/*`,
+    `*_browser.py`); com `topo`, lê no repositório dele, senão no atual.
+    Devolve só os valores não vazios.
+    """
+    if topo is None:
+        valores = cfg_todos("rapidoIgnorar")
+    else:
+        p = git(["config", "--get-all", "revisor.rapidoIgnorar"], cwd=topo)
+        valores = ([linha.strip() for linha in p.stdout.splitlines()
+                    if linha.strip()] if p.returncode == 0 else [])
+    return [v.strip() for v in valores if v.strip()]
+
+
 def selecionar_teste_rapido(prefixo: str, lista: list[str],
                              arquivos: list[str],
-                             raiz: str | None = None) -> list[str] | None:
+                             raiz: str | None = None,
+                             *,
+                             ignorar: list[str] | None = None) -> list[str] | None:
     """Monta o comando de check rápido para um check e os alterados.
 
     `prefixo` é a pasta coberta pelo check (`""` é a raiz), `lista` o
@@ -1942,7 +2065,13 @@ def selecionar_teste_rapido(prefixo: str, lista: list[str],
     de arquivos de teste (ou `compileall` sem teste correspondente);
     qualquer outro comando devolve None (sem seleção). Se o comando
     original tiver argumentos fora do conjunto simples conhecido, devolve
-    None para não descartá-los.
+    None para não descartá-los. `ignorar` (só no ramo pytest) lista globs
+    de testes pesados (ver `padroes_rapido_ignorar`): caminho relativo que
+    casa com algum padrão (caminho cheio ou basename, via `fnmatchcase`)
+    sai da seleção e vai para os pesados. Se restar teste leve, roda só
+    eles; se só houver pesado, roda `pytest -q --collect-only` com eles
+    (só importa/coleta, sem executar o navegador); sem teste nenhum,
+    `compileall` como antes.
     """
     if not lista:
         return None
@@ -2022,9 +2151,24 @@ def selecionar_teste_rapido(prefixo: str, lista: list[str],
                             break
                 if len(escolhidos) >= 30:
                     break
+        pesados: list[str] = []
+        if ignorar:
+            leves: list[str] = []
+            for caminho in escolhidos:
+                base = caminho.rsplit("/", 1)[-1]
+                if any(padrao and (fnmatch.fnmatchcase(caminho, padrao)
+                                   or fnmatch.fnmatchcase(base, padrao))
+                       for padrao in ignorar):
+                    pesados.append(caminho)
+                else:
+                    leves.append(caminho)
+            escolhidos = leves
         escolhidos = escolhidos[:30]
         if escolhidos:
             return [python, "-m", "pytest", "-q", *escolhidos]
+        if pesados:
+            return [python, "-m", "pytest", "-q", "--collect-only",
+                    *pesados[:30]]
         return [python, "-m", "compileall", "-q", *alterados_py]
     return None
 
@@ -2554,9 +2698,10 @@ def _rodar_checks_selecionados(sha: str, topo: str,
             return True, ""
         comandos: list[tuple[str, list[str], str, bool]] = []
         existentes = [a for a in arquivos if os.path.exists(os.path.join(tmp, a))]
+        ignorar = padroes_rapido_ignorar(topo)
         for prefixo, lista, cwd_rel, eh_manual in origem:
             selecionado = selecionar_teste_rapido(prefixo, lista, existentes,
-                                                  raiz=tmp)
+                                                  raiz=tmp, ignorar=ignorar)
             efetivo = selecionado if selecionado is not None else lista
             if (selecionado is not None and _selecao_degradada(selecionado)
                     and _toca_codigo(prefixo, arquivos)):
@@ -3055,8 +3200,7 @@ def rodar_checks_rapidos(sha: str, topo: str,
             return True, ""
         with worktree_checks(sha, topo) as tmp:
             pulos: list[str] = []
-            with trava(TEMPO_ESPERA_CHECK_RAPIDO,
-                       arquivo=arquivo_trava_checks()) as livre:
+            with trava_vaga_checks(TEMPO_ESPERA_CHECK_RAPIDO) as livre:
                 if not livre:
                     log("check rápido pulado: lock ocupado")
                     ok, rel = True, ""
@@ -3091,17 +3235,17 @@ def rodar_checks_rapidos(sha: str, topo: str,
         else:
             origem = [c for c in base_checks if _check_cobre(c[0], arquivos)]
         comandos: list[tuple[str, list[str], str, bool]] = []
+        ignorar = padroes_rapido_ignorar(topo)
         for prefixo, lista, cwd_rel, eh_manual in origem:
             rapido = selecionar_teste_rapido(prefixo, lista, arquivos,
-                                             raiz=tmp)
+                                             raiz=tmp, ignorar=ignorar)
             if rapido is not None:
                 comandos.append((prefixo, rapido, cwd_rel, eh_manual))
         if not comandos:
             log("check rápido: nada aplicável")
             _fechar_pulos(pulos)
             return True, ""
-        with trava(TEMPO_ESPERA_CHECK_RAPIDO,
-                   arquivo=arquivo_trava_checks()) as livre:
+        with trava_vaga_checks(TEMPO_ESPERA_CHECK_RAPIDO) as livre:
             if not livre:
                 log("check rápido pulado: lock ocupado")
                 ok, rel = True, ""
