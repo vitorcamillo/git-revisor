@@ -320,7 +320,7 @@ def test_correcao_usa_worker_reserva(repo, monkeypatch, tmp_path):
 
 
 def test_correcao_usa_terceiro_worker(repo, monkeypatch, tmp_path):
-    """GLM, Muse e Luna falhando, a correção sai pelo último worker (Haiku)."""
+    """GLM, Muse e Luna falhando, a correção sai pelo último worker (Opus 5.5)."""
     monkeypatch.setenv("WORKER_FALHA", "1")
     monkeypatch.setenv("WORKER_FALHA_MUSE", "1")
     monkeypatch.setenv("WORKER_FALHA2", "1")

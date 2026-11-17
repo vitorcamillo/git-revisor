@@ -4551,7 +4551,7 @@ def ordem_correcao(padrao: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _rodar_cadeia(tarefa: str, cwd: str) -> str | None:
-    """Roda o worker em cadeia (GLM → Muse → Luna → Haiku); devolve a família
+    """Roda o worker em cadeia (GLM → Muse → Luna → Opus 5.5); devolve a família
     do degrau que deu certo ("glm", "muse", "codex" ou "claude"), ou None se
     todos falharem. A família vem do NOME do comando quando ele revela
     (zcode/muse/codex/claude); senão, da posição do degrau na cadeia.
@@ -4566,8 +4566,8 @@ def _rodar_cadeia(tarefa: str, cwd: str) -> str | None:
                 "muse-ask --model muse-wonder-1.0 --effort max --timeout 1500",
                 "write"),
                ("REVISOR_CMD_WORKER2", "codex-ask", "write"),
-               # último recurso; a correção sempre passa de novo pelo revisor
-               ("REVISOR_CMD_WORKER3", "claude-ask --model haiku --effort high",
+               # último recurso: Opus 5.5 alto (gasta a cota do Claude); a correção sempre passa de novo pelo revisor
+               ("REVISOR_CMD_WORKER3", "claude-ask --model claude-opus-5-5 --effort high",
                 "write"))
     familias = ("glm", "muse", "codex", "claude")
     por_familia = dict(zip(familias, degraus))
