@@ -1,5 +1,9 @@
 # git-revisor
 
+![MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-green) ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white) ![Git](https://img.shields.io/badge/Git-hooks-F05032?logo=git&logoColor=white)
+
+**In English:** AI code review inside your Git hooks: it runs your tests, reviews the diff and blocks a push that would break `main`, optionally asking an AI worker to propose a fix in an isolated worktree.
+
 [Licença MIT](LICENSE) · Wrappers disponíveis em [worker-ask-router](https://github.com/vitorcamillo/worker-ask-router).
 
 ![Demonstração do git-revisor](docs/demo.png)
