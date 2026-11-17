@@ -553,8 +553,20 @@ def esperar_memoria(limite_s: int = 600,
 
 
 def lock_checks_ocupado() -> bool:
-    """True se TODAS as vagas de checks estão ocupadas AGORA (testa, não pega)."""
-    for caminho in arquivos_vagas_checks():
+    """True se TODAS as vagas de checks estão ocupadas AGORA (testa, não pega).
+
+    Vagas extras só contam como livres com carga (`carga_ok()`) e memória
+    (`mem_disponivel_mb()` é None ou >= `mem_minima_mb()`) folgadas, como
+    em `trava_vaga_checks`.
+    """
+    vagas = arquivos_vagas_checks()
+    extras = False
+    if len(vagas) > 1 and carga_ok():
+        restante = mem_disponivel_mb()
+        extras = restante is None or restante >= mem_minima_mb()
+    for indice, caminho in enumerate(vagas):
+        if indice >= 1 and not extras:
+            continue
         try:
             caminho.parent.mkdir(parents=True, exist_ok=True)
             arq = caminho.open("w")
@@ -675,12 +687,13 @@ def trava_vaga_checks(timeout_s: float | None) -> Iterator[bool]:
         with trava(timeout_s, arquivo=vagas[0]) as livre:
             yield livre
         return
-    for caminho in vagas:
-        caminho.parent.mkdir(parents=True, exist_ok=True)
-    abertos = [caminho.open("w") for caminho in vagas]
+    abertos: list = []
     ok = False
     dono = None
     try:
+        for caminho in vagas:
+            caminho.parent.mkdir(parents=True, exist_ok=True)
+            abertos.append(caminho.open("w"))
         fim = None if timeout_s is None else time.monotonic() + timeout_s
         while True:
             extras = False
@@ -2698,10 +2711,9 @@ def _rodar_checks_selecionados(sha: str, topo: str,
             return True, ""
         comandos: list[tuple[str, list[str], str, bool]] = []
         existentes = [a for a in arquivos if os.path.exists(os.path.join(tmp, a))]
-        ignorar = padroes_rapido_ignorar(topo)
         for prefixo, lista, cwd_rel, eh_manual in origem:
             selecionado = selecionar_teste_rapido(prefixo, lista, existentes,
-                                                  raiz=tmp, ignorar=ignorar)
+                                                  raiz=tmp)
             efetivo = selecionado if selecionado is not None else lista
             if (selecionado is not None and _selecao_degradada(selecionado)
                     and _toca_codigo(prefixo, arquivos)):

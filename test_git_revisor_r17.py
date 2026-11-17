@@ -1,8 +1,12 @@
 """Testes das vagas de checks e do filtro rápido de testes pesados (r17)."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import sys
 from pathlib import Path
+
+import pytest
 
 _ARQUIVO = Path(__file__).with_name("git_revisor.py")
 _spec = importlib.util.spec_from_file_location("git_revisor", _ARQUIVO)
@@ -83,6 +87,8 @@ def test_uma_vaga_ocupada_trava_e_acusa(monkeypatch):
 def test_lock_ocupado_so_com_todas_vagas_presas(monkeypatch):
     """Vaga 0 presa + vaga 1 livre: False; ambas presas: True."""
     _cfg_vagas(monkeypatch, 2)
+    monkeypatch.setattr(mod, "carga_ok", lambda: True)
+    monkeypatch.setattr(mod, "mem_disponivel_mb", lambda: 999999)
     vagas = mod.arquivos_vagas_checks()
     assert [vaga.name for vaga in vagas] == ["checks.lock", "checks.lock.1"]
     with mod.trava(None, arquivo=vagas[0]):
@@ -90,3 +96,116 @@ def test_lock_ocupado_so_com_todas_vagas_presas(monkeypatch):
         with mod.trava(None, arquivo=vagas[1]):
             assert mod.lock_checks_ocupado() is True
     assert mod.lock_checks_ocupado() is False
+
+
+def test_lock_ocupado_vaga_extra_sem_carga(monkeypatch):
+    """Vaga 0 presa + extra livre, carga alta: ocupado (extra não conta)."""
+    _cfg_vagas(monkeypatch, 2)
+    monkeypatch.setattr(mod, "carga_ok", lambda: False)
+    vagas = mod.arquivos_vagas_checks()
+    with mod.trava(None, arquivo=vagas[0]):
+        assert mod.lock_checks_ocupado() is True
+    assert mod.lock_checks_ocupado() is False
+
+
+def test_lock_ocupado_vaga_extra_sem_memoria(monkeypatch):
+    """Vaga 0 presa + extra livre, memória baixa: ocupado."""
+    _cfg_vagas(monkeypatch, 2)
+    monkeypatch.setattr(mod, "carga_ok", lambda: True)
+    monkeypatch.setattr(mod, "mem_disponivel_mb", lambda: 0)
+    vagas = mod.arquivos_vagas_checks()
+    with mod.trava(None, arquivo=vagas[0]):
+        assert mod.lock_checks_ocupado() is True
+
+
+def test_check_final_executa_pesado_sem_collect_only(monkeypatch, tmp_path):
+    """Check final selecionado não usa `rapidoIgnorar`: pesado executa."""
+    pesado = tmp_path / "tests" / "tv" / "test_a.py"
+    pesado.parent.mkdir(parents=True)
+    pesado.write_text("def test_a():\n    assert True\n", encoding="utf-8")
+
+    class _Proc:
+        """CompletedProcess mínimo para o fake de `mod.git`."""
+
+        def __init__(self, returncode, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def _git_falso(args, cwd=None, **_kw):
+        if args == ["config", "--get-all", "revisor.check"]:
+            return _Proc(0, f"{sys.executable} -m pytest -q\n")
+        if args == ["config", "--get-all", "revisor.rapidoIgnorar"]:
+            return _Proc(0, "tests/tv/*\n*_browser.py\n")
+        return _Proc(1)
+
+    monkeypatch.setattr(mod, "git", _git_falso)
+    monkeypatch.setattr(mod, "cache_checks_ativo", lambda _topo: False)
+    monkeypatch.setattr(mod, "log", lambda _msg: None)
+
+    @contextlib.contextmanager
+    def _wt(_sha, _topo):
+        yield str(tmp_path)
+
+    @contextlib.contextmanager
+    def _trava():
+        yield True
+
+    monkeypatch.setattr(mod, "worktree_checks", _wt)
+    monkeypatch.setattr(mod, "trava_checks", _trava)
+    recebidos = {}
+
+    def _executar(comandos, _tmp, _timeout, _pulos=None, **_kw):
+        recebidos["comandos"] = comandos
+        return True, ""
+
+    monkeypatch.setattr(mod, "_executar_checks", _executar)
+    ok, rel = mod._rodar_checks_selecionados(
+        "abc", str(tmp_path), ["tests/tv/test_a.py"])
+    assert (ok, rel) == (True, "")
+    assert recebidos["comandos"] == [
+        ("", [sys.executable, "-m", "pytest", "-q",
+              "tests/tv/test_a.py"], "", True)]
+    assert "--collect-only" not in recebidos["comandos"][0][1]
+
+
+class _ArqFalso:
+    """Arquivo falso que registra o fechamento."""
+
+    def __init__(self):
+        self.fechado = False
+
+    def close(self):
+        self.fechado = True
+
+
+class _PaiFalso:
+    """Pai falso com `mkdir` inofensivo."""
+
+    def mkdir(self, parents=False, exist_ok=False):
+        pass
+
+
+class _CaminhoFalso:
+    """Caminho falso cuja abertura pode falhar."""
+
+    def __init__(self, arq=None, erro=False):
+        self.parent = _PaiFalso()
+        self._arq = arq
+        self._erro = erro
+
+    def open(self, _modo):
+        if self._erro:
+            raise OSError("falha ao abrir")
+        return self._arq
+
+
+def test_trava_vaga_falha_ao_abrir_fecha_ja_abertos(monkeypatch):
+    """Falha ao abrir a 2ª vaga fecha a 1ª já aberta (sem vazar)."""
+    arq = _ArqFalso()
+    vagas = [_CaminhoFalso(arq), _CaminhoFalso(erro=True)]
+    monkeypatch.setattr(mod, "arquivos_vagas_checks", lambda: vagas)
+    with pytest.raises(OSError):
+        with mod.trava_vaga_checks(0):
+            pass
+    assert arq.fechado is True
