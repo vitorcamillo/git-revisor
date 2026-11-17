@@ -3779,7 +3779,9 @@ def disparar_correcao_push(novos: list[str], local_sha: str, remote: str,
     print("revisor: lote reprovado; correção rodando em segundo plano. "
           "Quando aprovada, será aplicada e enviada sozinha "
           "(git revisor status). Este push foi cancelado para não enviar "
-          "código reprovado.")
+          "código reprovado. Agente: não pergunte ao usuário nem repita o "
+          "push; se a correção em fundo falhar, corrija os achados de "
+          ".git/revisor/relatorios/ e faça o push de novo.")
     return 1
 
 
