@@ -2,6 +2,10 @@
 
 [Licença MIT](LICENSE) · Wrappers disponíveis em [worker-ask-router](https://github.com/vitorcamillo/worker-ask-router).
 
+![Demonstração do git-revisor](docs/demo.png)
+
+*O git-revisor barrando um push: os testes falham e o commit fica reprovado até ser corrigido.*
+
 O `git-revisor` adiciona revisão automatizada de commits por IA aos hooks do Git. Ele ajuda a encontrar problemas antes de enviar mudanças, combina revisão de diff com checks determinísticos e pode bloquear um push reprovado. Se a revisão reprovar, pode pedir a um worker externo que proponha uma correção em um worktree e submeter a alteração novamente à revisão.
 
 ## Como funciona
