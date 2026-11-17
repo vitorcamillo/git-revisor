@@ -4528,6 +4528,28 @@ def rodar_worker(tarefa: str, cwd: str) -> str | None:
                     f"({', '.join(avisados)[:200]}){detalhe}")
 
 
+def arquivo_ordem_correcao() -> Path:
+    """JSON {"correcao": [...]} com a ordem da cadeia de correção (painel Harness)."""
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return config / "git-revisor" / "ordem.json"
+
+
+def ordem_correcao(padrao: tuple[str, ...]) -> tuple[str, ...]:
+    """Ordem das famílias da correção: a do arquivo se for permutação exata de
+    `padrao`; senão (ausente, inválido, faltando ou sobrando família) `padrao`."""
+    try:
+        dados = json.loads(arquivo_ordem_correcao().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return padrao
+    ordem = dados.get("correcao") if isinstance(dados, dict) else None
+    if (isinstance(ordem, list) and all(isinstance(f, str) for f in ordem)
+            and len(ordem) == len(padrao) and sorted(ordem) == sorted(padrao)):
+        return tuple(ordem)
+    if ordem is not None:
+        log("ordem.json da correção inválido; usando a ordem padrão")
+    return padrao
+
+
 def _rodar_cadeia(tarefa: str, cwd: str) -> str | None:
     """Roda o worker em cadeia (GLM → Muse → Luna → Haiku); devolve a família
     do degrau que deu certo ("glm", "muse", "codex" ou "claude"), ou None se
@@ -4548,6 +4570,9 @@ def _rodar_cadeia(tarefa: str, cwd: str) -> str | None:
                ("REVISOR_CMD_WORKER3", "claude-ask --model haiku --effort high",
                 "write"))
     familias = ("glm", "muse", "codex", "claude")
+    por_familia = dict(zip(familias, degraus))
+    familias = ordem_correcao(familias)
+    degraus = tuple(por_familia[f] for f in familias)
     for i, (familia, (nome_env, padrao, modo)) in enumerate(zip(familias, degraus)):
         cmd = comando(nome_env, padrao)
         ate = sem_cota_ate(familias[i])
