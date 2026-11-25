@@ -8,6 +8,8 @@ def cache_isolado(tmp_path, monkeypatch, request):
     """Isola o cache de repositório em cada teste."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # lock de checks real fica fora
+    # ordem.json real da máquina (painel Harness) mudaria a cadeia de correção
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.chdir(tmp_path)
     # vagas extras de checks dependem da carga da máquina e do git config
     # global do usuário: os testes fixam uma vaga só (o lock único)
