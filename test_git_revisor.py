@@ -931,6 +931,18 @@ def test_patches_de_mostra_conteudo_de_merge(repo):
     assert "MUDANCA_ESCONDIDA" in gr.patches_de([ponta])
 
 
+
+def test_patches_e_diff_aceitam_byte_fora_do_utf8(repo):
+    """PDF/cp1252 sem NUL vira texto no diff: byte inválido não derruba o push."""
+    base = commit_arquivo(repo, "base.txt", "base\n", "base")
+    (repo / "relatorio.pdf").write_bytes(b"%PDF-1.4\n\x93aspas\x94\n")
+    git(repo, "add", "relatorio.pdf")
+    p = git(repo, "commit", "-q", "-m", "pdf", env_extra={"REVISOR_INTERNO": "1"})
+    assert p.returncode == 0, p.stderr
+    ponta = git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert "relatorio.pdf" in gr.patches_de([ponta])
+    assert "\ufffdaspas" in gr.diff_entre(base, ponta)
+
 # ==================== correções da rodada 3 ====================
 
 # ------------------------------------- família do revisor e autorrevisão (item 1)

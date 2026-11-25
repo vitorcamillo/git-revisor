@@ -202,9 +202,14 @@ def env_limpo(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 def git(args: list[str], cwd: str | None = None, timeout: int = TEMPO_GIT,
         env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    """Roda git com lista de argumentos (sem shell), capturando stdout/stderr."""
+    """Roda git com lista de argumentos (sem shell), capturando stdout/stderr.
+
+    Arquivo com byte fora do UTF-8 (PDF sem NUL, texto em cp1252) chega no
+    diff como texto; troca o byte por U+FFFD em vez de derrubar o push.
+    """
     return subprocess.run(["git", *args], cwd=cwd, check=False, capture_output=True,
-                          text=True, timeout=timeout, env=env_limpo(env_extra))
+                          text=True, encoding="utf-8", errors="replace",
+                          timeout=timeout, env=env_limpo(env_extra))
 
 
 def git_out(args: list[str], cwd: str | None = None, timeout: int = TEMPO_GIT) -> str:
