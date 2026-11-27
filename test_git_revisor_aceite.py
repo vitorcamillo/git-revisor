@@ -336,6 +336,64 @@ def test_chave_parte_muda_com_aceite_e_preserva_sem() -> None:
     assert mod.chave_parte("DIFF", None, None, "1. regra b") != com
 
 
+def test_aceite_da_intencao_preserva_referencia_dentro_do_criterio() -> None:
+    """Só o `[sha7]` após a numeração sai; referência no texto fica."""
+    base = f"feat: x\n{mod.MARCADOR_ACEITE}\n"
+    a = mod.aceite_da_intencao(base + "1. [abc1234] regra [1111111] vale\n")
+    b = mod.aceite_da_intencao(base + "1. [abc1234] regra [2222222] vale\n")
+    assert a == "1. regra [1111111] vale"
+    assert b == "1. regra [2222222] vale"
+    assert a != b
+    assert mod.chave_parte("DIFF", None, None, a) != mod.chave_parte(
+        "DIFF", None, None, b)
+
+
+def test_chave_parte_multipartes_so_com_aceite() -> None:
+    """Com critérios, parte e diff completo têm chaves distintas; sem, não."""
+    sem = mod.chave_parte("DIFF", None, None)
+    assert mod.chave_parte("DIFF", None, None, "", multipartes=True) == sem
+    completo = mod.chave_parte("DIFF", None, None, "1. regra a")
+    assert mod.chave_parte(
+        "DIFF", None, None, "1. regra a", multipartes=False) == completo
+    assert mod.chave_parte(
+        "DIFF", None, None, "1. regra a", multipartes=True) != completo
+
+
+def test_parte_multipartes_nao_reaproveitada_como_diff_completo(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parte aprovada em multipartes é revisada de novo como diff completo."""
+    cache: dict[str, str] = {}
+    chamadas: list[str] = []
+    monkeypatch.setattr(mod, "MAX_DIFF_BYTES", 500)
+    monkeypatch.setattr(mod, "cache_parte_ativo", lambda topo=None: True)
+    monkeypatch.setattr(mod, "cache_veredito_ativo", lambda topo=None: True)
+    monkeypatch.setattr(mod, "ler_cache_parte", lambda chave: cache.get(chave))
+    monkeypatch.setattr(
+        mod, "gravar_cache_parte",
+        lambda chave, resumo: cache.__setitem__(chave, "codex"))
+    monkeypatch.setattr(
+        mod, "cfg",
+        lambda chave, padrao: padrao if chave == "maxPartes" else "1")
+    monkeypatch.setattr(mod, "familia_revisor", lambda saida: "codex")
+
+    def falso(prompt: str, cwd: str) -> tuple[str, str]:
+        chamadas.append(prompt)
+        return "APROVADO", "ok"
+
+    monkeypatch.setattr(mod, "revisar_com_ia", falso)
+    intencao = f"feat: x\n{mod.MARCADOR_ACEITE}\n1. [abc1234] regra a"
+    texto = ("commit " + "a" * 450 + "\n") + ("commit " + "b" * 450 + "\n")
+    veredito, _, _ = mod.revisar_por_partes(
+        texto, "repo", "abc1234", intencao=intencao)
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 2
+    primeira = mod.dividir_em_partes(texto)[0]
+    veredito, _, _ = mod.revisar_por_partes(
+        primeira, "repo", "abc1234", intencao=intencao)
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 3
+
+
 def test_revisar_diff_cache_de_arvore_nao_cobre_aceite_novo(
         repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Árvore já aprovada volta ao revisor quando surgem critérios de aceite."""

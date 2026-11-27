@@ -1503,17 +1503,20 @@ def aceite_commits(shas: list[str]) -> str | None:
 
 
 def aceite_da_intencao(intencao: str | None) -> str:
-    """Critérios do bloco MARCADOR_ACEITE da intenção, sem o `[sha7]`.
+    """Critérios do bloco MARCADOR_ACEITE da intenção, sem o `[sha7]` de origem.
 
-    Entra na chave dos caches de veredito: critério novo ou alterado invalida
-    o APROVADO guardado, e amend/rebase (sha novo, mesmo texto) não. Vazio
-    quando a intenção não traz critérios.
+    Só o `[sha7]` logo após a numeração (`N. [sha7] texto`, formato de
+    `aceite_commits`) é removido: referências `[abcdef0]` dentro do texto
+    do critério fazem parte da exigência e são preservadas. Entra na chave
+    dos caches de veredito: critério novo ou alterado invalida o APROVADO
+    guardado, e amend/rebase (sha novo, mesmo texto) não. Vazio quando a
+    intenção não traz critérios.
     """
     if not intencao or MARCADOR_ACEITE not in intencao:
         return ""
     bloco = intencao.split(MARCADOR_ACEITE, 1)[1]
     bloco = bloco.split("\n== errata (.revisor/errata.md) ==", 1)[0]
-    return re.sub(r"\[[0-9a-f]{7}\] ", "", bloco).strip()
+    return re.sub(r"(?m)^(\d+[.)] )\[[0-9a-f]{7}\] ", r"\1", bloco).strip()
 
 
 def intencao_commits(shas: list[str], ponta: str | None = None,
@@ -3472,7 +3475,8 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
         paralelo = 3
 
     aceite = aceite_da_intencao(intencao)
-    chaves = [chave_parte(parte, risco_alto, contexto_repo, aceite)
+    chaves = [chave_parte(parte, risco_alto, contexto_repo, aceite,
+                          multipartes=total > 1)
               for parte in partes]
     familia_cache: dict[int, str] = {}
     if cache_parte_ativo(repo) and cache_veredito_ativo(repo):
@@ -3585,20 +3589,26 @@ def cache_parte_ativo(topo: str | None = None) -> bool:
 
 
 def chave_parte(parte: str, risco_alto: list[str] | None,
-                contexto_repo: str | None, aceite: str = "") -> str:
+                contexto_repo: str | None, aceite: str = "",
+                multipartes: bool = False) -> str:
     """Chave sha256 da parte: texto, risco alto, contexto do repo e versão.
 
     `relatorio_anterior`, `commits`, `contexto`, `intencao`, `evidencia` e o
     rótulo "PARTE i de N" ficam fora: o veredito depende só do conteúdo.
     Exceção: os critérios de aceite (`aceite_da_intencao`) entram na chave
     quando existem, porque mudam o que o revisor cobra; sem critérios a
-    chave é a mesma de antes.
+    chave é a mesma de antes. Havendo critérios, o modo multipartes também
+    entra (`multipartes=True`): numa parte o revisor pode não verificar
+    critério que esteja em outra parte, aprovação mais fraca que a do diff
+    completo com o mesmo texto, e as duas não compartilham cache.
     """
     dados = {"parte": parte, "risco": sorted(risco_alto or []),
              "contexto_repo": contexto_repo or "",
              "versao": VERSAO_CACHE_PARTE}
     if aceite:
         dados["aceite"] = aceite
+        if multipartes:
+            dados["multipartes"] = True
     return hashlib.sha256(json.dumps(
         dados, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
