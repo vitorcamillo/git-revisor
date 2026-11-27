@@ -82,6 +82,7 @@ All commands use the form `git revisor <subcommand>`, resolved by the `git-revis
 | `corrigir-push <sha>` | Runs the fix of a push in the background. |
 | `retentar-push <sha>` | Waits for the machine to become free and resends a push held for infra or lock reasons. |
 | `suite-completa <sha>` | Runs the full suite of the tree in the background. |
+| `qa <sha>` | Runs the client QA of an already pushed sha. |
 | `pendentes` | Re-reviews the commits left inconclusive. |
 | `status [<sha>]` | Shows the repository summary or the report of one commit. |
 | `ligar` | Enables the reviewer in this repository (`revisor.enabled=true`). |
@@ -148,6 +149,33 @@ git config revisor.autopush true
 - Pre-push also blocks sending when `gitleaks` finds a possible secret in the push history.
 - Acceptance criteria: an `Aceite:` section in the commit message body (header alone on its line, items `1.`, `1)`, `-` or `*`, a blank line ends it) is handed to the AI reviewer. A criterion not met by the diff fails the push, and the report shows `ACEITE: met/total`. Limits: a low-risk-only change does not go through the AI, and in a diff split into several parts a final check verifies in the repository the criteria that no part failed.
 - Commits too large for automatic review require manual review. Run `git revisor status` to see the state and the available reports.
+
+## Client QA
+
+After an approved push, the reviewer can run a QA that uses the product as a client (headless browser, API, forced errors). It reads the `Aceite:` criteria from the commits and returns findings with proof; an independent verifier re-runs the proofs and only confirmed findings count. It never blocks the push and is opt-in per repository.
+
+To enable it, configure and commit the script (targets and journeys to cover):
+
+```bash
+git config revisor.qa true
+```
+
+Optional: a versioned `.revisor/qa-armadilhas.md` lists known false positives; the QA learns more on its own in `.git/revisor/qa/armadilhas.md`.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `REVISOR_CMD_QA` | `codex-ask --mode qa` | Agent that uses the product as a client. |
+| `REVISOR_CMD_QA_VERIFICAR` | `claude-ask --mode qa` | Independent verifier of the proofs. |
+| `REVISOR_QA_TIMEOUT` | `1500` | Timeout in seconds for each QA call. |
+| `REVISOR_QA_ESPERA` | `1200` | Ceiling in seconds for waiting on the remote and on `revisor.qaPronto`. |
+| `REVISOR_QA_INTERVALO` | `20` | Interval in seconds between wait polls. |
+| `REVISOR_QA_RODADAS` | `2` | Limit of automatic fix rounds per chain. |
+| `REVISOR_QA` | — | With `0`, turns QA off even when configured. |
+
+Known limits: one run per repository (a new push ends the previous one for another sha); `revisor.qaPronto` (a shell line run via `sh -c` with `REVISOR_QA_SHA`, exit 0 releases) holds QA until the environment is ready; no automatic fix by default — `git config revisor.qaCorrigir true` enables it (the fix goes through review and a new QA, up to the round limit); only confirmed BAIXA findings go to `.git/revisor/qa/baixa.md`, without notifying.
+
+The QA prohibitions (payments, passwords or personal data outside a local host, CAPTCHA, third-party sites) are enforced by the prompt and by running in an empty directory, not by a network block. Logged-in flows do not receive a test credential yet. Auto-fix (`revisor.qaCorrigir`) is unit-tested only, with no live proof.
+
 
 ## Limitations and responsible use
 

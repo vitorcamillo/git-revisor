@@ -82,6 +82,7 @@ Todos os comandos usam a forma `git revisor <subcomando>`, resolvida pelo execut
 | `corrigir-push <sha>` | Executa a correção de um push em segundo plano. |
 | `retentar-push <sha>` | Aguarda a máquina liberar e reenvia um push segurado por infra ou lock. |
 | `suite-completa <sha>` | Roda a suíte completa da árvore em segundo plano. |
+| `qa <sha>` | Roda o QA cliente de um sha já empurrado. |
 | `pendentes` | Re-revisa os commits que ficaram inconclusivos. |
 | `status [<sha>]` | Mostra o resumo do repositório ou o relatório de um commit. |
 | `ligar` | Ativa o revisor neste repositório (`revisor.enabled=true`). |
@@ -148,6 +149,33 @@ git config revisor.autopush true
 - O pre-push também bloqueia o envio quando o `gitleaks` encontra possível segredo no histórico do push.
 - Critérios de aceite: uma seção `Aceite:` no corpo da mensagem do commit (cabeçalho sozinho na linha, itens `1.`, `1)`, `-` ou `*`, linha em branco encerra) é entregue ao revisor de IA. Critério não atendido pelo diff reprova o push e o relatório traz `ACEITE: atendidos/total`. Limites: mudança só de baixo risco não passa pela IA, e em diff dividido em várias partes uma conferência final confere no repositório os critérios que nenhuma parte reprovou.
 - Commits grandes demais para revisão automática exigem revisão manual. Consulte `git revisor status` para ver o estado e os relatórios disponíveis.
+
+## QA cliente
+
+Após um push aprovado, o revisor pode rodar um QA que usa o produto como cliente (navegador sem janela, API, erros forçados). Ele lê os critérios `Aceite:` dos commits e devolve achados com prova; um verificador independente reexecuta as provas e só o confirmado vale. Nunca bloqueia o push e é opt-in por repositório.
+
+Para ligar, configure e commite o roteiro (alvos e jornadas a percorrer):
+
+```bash
+git config revisor.qa true
+```
+
+Opcional: `.revisor/qa-armadilhas.md` versionado lista falsos positivos conhecidos; o QA aprende outros sozinho em `.git/revisor/qa/armadilhas.md`.
+
+| Variável | Padrão | Efeito |
+| --- | --- | --- |
+| `REVISOR_CMD_QA` | `codex-ask --mode qa` | Agente que usa o produto como cliente. |
+| `REVISOR_CMD_QA_VERIFICAR` | `claude-ask --mode qa` | Verificador independente das provas. |
+| `REVISOR_QA_TIMEOUT` | `1500` | Timeout em segundos de cada chamada do QA. |
+| `REVISOR_QA_ESPERA` | `1200` | Teto em segundos da espera pelo remoto e pelo `revisor.qaPronto`. |
+| `REVISOR_QA_INTERVALO` | `20` | Intervalo em segundos entre sondagens da espera. |
+| `REVISOR_QA_RODADAS` | `2` | Limite de rodadas de correção automática por cadeia. |
+| `REVISOR_QA` | — | Com `0`, desliga o QA mesmo configurado. |
+
+Limites conhecidos: uma execução por repositório (push novo encerra a anterior de outro sha); `revisor.qaPronto` (linha de shell rodada em `sh -c` com `REVISOR_QA_SHA`, exit 0 libera) segura o QA até o ambiente ficar pronto; sem correção automática por padrão — `git config revisor.qaCorrigir true` liga (a correção passa por revisão e novo QA, até o limite de rodadas); só achado BAIXA confirmado vai para `.git/revisor/qa/baixa.md`, sem notificar.
+
+As proibições do QA (pagamento, senha ou dado pessoal fora de host local, CAPTCHA, site de terceiros) valem por prompt e por rodar em diretório vazio, não por bloqueio de rede. Fluxo logado ainda não recebe credencial de teste. A correção automática (`revisor.qaCorrigir`) tem só teste unitário, sem prova ao vivo.
+
 
 ## Limitações e uso responsável
 
