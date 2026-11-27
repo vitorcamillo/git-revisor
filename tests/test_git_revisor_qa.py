@@ -545,7 +545,11 @@ def test_correcao_positiva_agenda_revalidacao_sem_matar_supervisor(
     class _ProcFalso:
         pid = 424242
 
-    def popen_falso(cmd: list[str], **kwargs) -> _ProcFalso:
+    popen_real = subprocess.Popen
+
+    def popen_falso(cmd: list[str], **kwargs) -> _ProcFalso | subprocess.Popen:
+        if cmd and cmd[0] == "git":
+            return popen_real(cmd, **kwargs)
         comandos.append((cmd, kwargs))
         return _ProcFalso()
 
