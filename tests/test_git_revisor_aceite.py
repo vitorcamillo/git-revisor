@@ -436,12 +436,13 @@ def test_parte_multipartes_nao_reaproveitada_como_diff_completo(
     veredito, _, _ = mod.revisar_por_partes(
         texto, "repo", "abc1234", intencao=intencao)
     assert veredito == "APROVADO"
-    assert len(chamadas) == 2
+    # 2 partes + conferência final de aceite (multipartes com critérios).
+    assert len(chamadas) == 3
     primeira = mod.dividir_em_partes(texto)[0]
     veredito, _, _ = mod.revisar_por_partes(
         primeira, "repo", "abc1234", intencao=intencao)
     assert veredito == "APROVADO"
-    assert len(chamadas) == 3
+    assert len(chamadas) == 4
 
 
 def test_revisar_diff_cache_de_arvore_nao_cobre_aceite_novo(
@@ -464,3 +465,225 @@ def test_revisar_diff_cache_de_arvore_nao_cobre_aceite_novo(
     assert len(chamadas) == 2                                # aceite novo revisa
     mod.revisar_diff(base, ponta, str(repo), "c", intencao=com)
     assert len(chamadas) == 2                                # e fica em cache
+
+
+# ------------------------------------------- conferência final de aceite
+
+_RODAPE_CODEX = "--- codex-ask: modo=review gpt ---"
+_OK_PARTE = ("- nenhum problema relevante\nVEREDITO: APROVADO\n"
+             + _RODAPE_CODEX)
+
+
+def _duas_partes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Força `dividir_em_partes` a devolver sempre 2 partes."""
+    monkeypatch.setattr(mod, "dividir_em_partes",
+                        lambda t: ["PARTE-A\n" + t, "PARTE-B\n" + t])
+
+
+def _texto_conferencia() -> str:
+    """Diff com dois arquivos, para a lista da conferência."""
+    return ("diff --git a/a.txt b/a.txt\n+x\n"
+            "diff --git a/b.txt b/b.txt\n+y\n")
+
+
+def _intencao_regra_a() -> str:
+    """Intenção com um critério de aceite."""
+    return f"feat: x\n{mod.MARCADOR_ACEITE}\n1. [abc1234] regra a"
+
+
+def test_conferencia_aprovada_faz_tres_chamadas(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """2 partes + aceite aprovadas: 3 chamadas, a última é a conferência."""
+    _duas_partes(monkeypatch)
+    chamadas: list[str] = []
+    monkeypatch.setattr(
+        mod, "revisar_com_ia",
+        lambda prompt, cwd: (chamadas.append(prompt),
+                             ("APROVADO", _OK_PARTE))[1])
+    veredito, saida, _ = mod.revisar_por_partes(
+        _texto_conferencia(), str(repo), "abc1234",
+        intencao=_intencao_regra_a())
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 3
+    conf = chamadas[-1]
+    assert "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in conf
+    assert "1. regra a" in conf
+    assert "a.txt" in conf and "b.txt" in conf
+    assert "aceite conferido" in saida
+
+
+def test_conferencia_reprovada_reprova_o_conjunto(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Conferência REPROVADO: veredito REPROVADO e relatório é o dela."""
+    _duas_partes(monkeypatch)
+    reprovada = ("- [MEDIA] aceite 1 — falta X — correção Y\n"
+                 "ACEITE: 0/1\nVEREDITO: REPROVADO\n" + _RODAPE_CODEX)
+    chamadas: list[str] = []
+
+    def falso(prompt: str, cwd: str) -> tuple[str, str]:
+        chamadas.append(prompt)
+        if "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in prompt:
+            return "REPROVADO", reprovada
+        return "APROVADO", _OK_PARTE
+
+    monkeypatch.setattr(mod, "revisar_com_ia", falso)
+    veredito, saida, _ = mod.revisar_por_partes(
+        _texto_conferencia(), str(repo), "abc1234",
+        intencao=_intencao_regra_a())
+    assert veredito == "REPROVADO"
+    assert saida == reprovada
+    assert len(chamadas) == 3
+
+
+def test_conferencia_sem_cota_vale_para_o_todo(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Conferência SEM_COTA: o todo devolve SEM_COTA."""
+    _duas_partes(monkeypatch)
+
+    def falso(prompt: str, cwd: str) -> tuple[str, str]:
+        if "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in prompt:
+            return "SEM_COTA", "x"
+        return "APROVADO", _OK_PARTE
+
+    monkeypatch.setattr(mod, "revisar_com_ia", falso)
+    veredito, saida, _ = mod.revisar_por_partes(
+        _texto_conferencia(), str(repo), "abc1234",
+        intencao=_intencao_regra_a())
+    assert veredito == "SEM_COTA"
+    assert saida == "x"
+
+
+def test_duas_partes_sem_aceite_sem_conferencia(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """2 partes sem aceite: 2 chamadas, nenhuma conferência."""
+    _duas_partes(monkeypatch)
+    chamadas: list[str] = []
+    monkeypatch.setattr(
+        mod, "revisar_com_ia",
+        lambda prompt, cwd: (chamadas.append(prompt),
+                             ("APROVADO", _OK_PARTE))[1])
+    veredito, _, _ = mod.revisar_por_partes(
+        _texto_conferencia(), str(repo), "abc1234",
+        intencao="feat: sem seção")
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 2
+    assert not [p for p in chamadas
+                if "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in p]
+
+
+def test_uma_parte_com_aceite_sem_conferencia(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """1 parte + aceite: 1 chamada, nenhuma conferência."""
+    chamadas: list[str] = []
+    monkeypatch.setattr(
+        mod, "revisar_com_ia",
+        lambda prompt, cwd: (chamadas.append(prompt),
+                             ("APROVADO", _OK_PARTE))[1])
+    veredito, _, _ = mod.revisar_por_partes(
+        "diff pequeno", str(repo), "abc1234", intencao=_intencao_regra_a())
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 1
+    assert "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" not in chamadas[0]
+
+
+def test_conferencia_em_cache_na_segunda_chamada(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """2ª chamada igual: partes e conferência em cache, sem chamar o revisor."""
+    _duas_partes(monkeypatch)
+    chamadas: list[str] = []
+    monkeypatch.setattr(
+        mod, "revisar_com_ia",
+        lambda prompt, cwd: (chamadas.append(prompt),
+                             ("APROVADO", _OK_PARTE))[1])
+    intencao = _intencao_regra_a()
+    veredito, saida, _ = mod.revisar_por_partes(
+        _texto_conferencia(), str(repo), "abc1234", intencao=intencao)
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 3
+    veredito, saida, _ = mod.revisar_por_partes(
+        _texto_conferencia(), str(repo), "abc1234", intencao=intencao)
+    assert veredito == "APROVADO"
+    assert "aceite conferido" in saida
+    assert len(chamadas) == 3  # nada novo: partes e conferência em cache
+
+
+def test_conferencia_roda_de_novo_com_outro_criterio(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mesmas 2 partes com outro critério: a conferência roda de novo."""
+    _duas_partes(monkeypatch)
+    chamadas: list[str] = []
+    monkeypatch.setattr(
+        mod, "revisar_com_ia",
+        lambda prompt, cwd: (chamadas.append(prompt),
+                             ("APROVADO", _OK_PARTE))[1])
+    texto = _texto_conferencia()
+    mod.revisar_por_partes(texto, str(repo), "abc1234",
+                           intencao=_intencao_regra_a())
+    assert len(chamadas) == 3
+    outra = f"feat: x\n{mod.MARCADOR_ACEITE}\n1. [abc1234] regra b"
+    veredito, _, _ = mod.revisar_por_partes(
+        texto, str(repo), "abc1234", intencao=outra)
+    assert veredito == "APROVADO"
+    conferencias = [p for p in chamadas
+                    if "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in p]
+    assert len(conferencias) == 2
+    assert "1. regra b" in conferencias[-1]
+
+
+def test_conferencia_no_ramo_sequencial(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Com `revisor.paralelo 1`, a conferência acontece do mesmo jeito."""
+    _git(repo, "config", "revisor.paralelo", "1")
+    _duas_partes(monkeypatch)
+    chamadas: list[str] = []
+    monkeypatch.setattr(
+        mod, "revisar_com_ia",
+        lambda prompt, cwd: (chamadas.append(prompt),
+                             ("APROVADO", _OK_PARTE))[1])
+    veredito, saida, _ = mod.revisar_por_partes(
+        _texto_conferencia(), str(repo), "abc1234",
+        intencao=_intencao_regra_a())
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 3
+    assert "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in chamadas[-1]
+    assert "aceite conferido" in saida
+
+
+def test_conferencia_no_ramo_paralelo(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ramo paralelo (padrão), a conferência acontece do mesmo jeito."""
+    _duas_partes(monkeypatch)
+    chamadas: list[str] = []
+    monkeypatch.setattr(
+        mod, "revisar_com_ia",
+        lambda prompt, cwd: (chamadas.append(prompt),
+                             ("APROVADO", _OK_PARTE))[1])
+    veredito, saida, _ = mod.revisar_por_partes(
+        _texto_conferencia(), str(repo), "abc1234",
+        intencao=_intencao_regra_a())
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 3
+    assert "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in chamadas[-1]
+    assert "aceite conferido" in saida
+
+
+def test_arquivos_do_diff_dois_repeticao_e_rename() -> None:
+    """Dois arquivos, repetição ignorada e rename devolve o destino."""
+    texto = ("diff --git a/a.txt b/a.txt\n+x\n"
+             "diff --git a/a.txt b/a.txt\n+y\n"
+             "diff --git a/antigo.txt b/novo.txt\n+z\n")
+    assert mod.arquivos_do_diff(texto) == ["a.txt", "novo.txt"]
+    assert mod.arquivos_do_diff("sem diff aqui") == []
+
+
+def test_montar_prompt_conferencia_mais_de_60() -> None:
+    """Acima de 60 arquivos, a lista termina com ` e mais K`."""
+    arquivos = [f"f{i}.txt" for i in range(65)]
+    prompt = mod.montar_prompt_conferencia(
+        "repo", "abc1234", "1. regra a", arquivos, 2)
+    assert " e mais 5" in prompt
+    assert "f59.txt" in prompt
+    assert "f64.txt" not in prompt
+    assert "em 2 partes separadas" in prompt
+    assert "Repositório: repo  Commit(s): abc1234" in prompt
+    assert "1. regra a" in prompt

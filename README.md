@@ -146,7 +146,7 @@ git config revisor.autopush true
 - Mudanças classificadas como baixo risco podem passar sem revisão de IA, mas os checks configurados ou detectados continuam sendo considerados.
 - Quando há reprovação, o worker prepara uma correção isolada em worktree. A correção também passa pelos checks e por uma revisão independente antes de ser aceita.
 - O pre-push também bloqueia o envio quando o `gitleaks` encontra possível segredo no histórico do push.
-- Critérios de aceite: uma seção `Aceite:` no corpo da mensagem do commit (cabeçalho sozinho na linha, itens `1.`, `1)`, `-` ou `*`, linha em branco encerra) é entregue ao revisor de IA. Critério não atendido pelo diff reprova o push e o relatório traz `ACEITE: atendidos/total`. Limites: mudança só de baixo risco não passa pela IA, e em diff dividido em várias partes só é reprovado o critério que alguma parte contraria.
+- Critérios de aceite: uma seção `Aceite:` no corpo da mensagem do commit (cabeçalho sozinho na linha, itens `1.`, `1)`, `-` ou `*`, linha em branco encerra) é entregue ao revisor de IA. Critério não atendido pelo diff reprova o push e o relatório traz `ACEITE: atendidos/total`. Limites: mudança só de baixo risco não passa pela IA, e em diff dividido em várias partes uma conferência final confere no repositório os critérios que nenhuma parte reprovou.
 - Commits grandes demais para revisão automática exigem revisão manual. Consulte `git revisor status` para ver o estado e os relatórios disponíveis.
 
 ## Limitações e uso responsável

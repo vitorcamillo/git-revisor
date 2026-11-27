@@ -146,7 +146,7 @@ git config revisor.autopush true
 - Changes classified as low risk may pass without AI review, but the configured or detected checks still apply.
 - When a review fails, the worker prepares an isolated fix in a worktree. The fix also goes through the checks and an independent review before being accepted.
 - Pre-push also blocks sending when `gitleaks` finds a possible secret in the push history.
-- Acceptance criteria: an `Aceite:` section in the commit message body (header alone on its line, items `1.`, `1)`, `-` or `*`, a blank line ends it) is handed to the AI reviewer. A criterion not met by the diff fails the push, and the report shows `ACEITE: met/total`. Limits: a low-risk-only change does not go through the AI, and in a diff split into several parts only a criterion that some part contradicts is failed.
+- Acceptance criteria: an `Aceite:` section in the commit message body (header alone on its line, items `1.`, `1)`, `-` or `*`, a blank line ends it) is handed to the AI reviewer. A criterion not met by the diff fails the push, and the report shows `ACEITE: met/total`. Limits: a low-risk-only change does not go through the AI, and in a diff split into several parts a final check verifies in the repository the criteria that no part failed.
 - Commits too large for automatic review require manual review. Run `git revisor status` to see the state and the available reports.
 
 ## Limitations and responsible use
