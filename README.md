@@ -1,37 +1,45 @@
 # git-revisor
 
+**Português** · [English](README.en.md)
+
 ![MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-green) ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white) ![Git](https://img.shields.io/badge/Git-hooks-F05032?logo=git&logoColor=white)
 
-**In English:** AI code review inside your Git hooks: it runs your tests, reviews the diff and blocks a push that would break `main`, optionally asking an AI worker to propose a fix in an isolated worktree.
-
-[Licença MIT](LICENSE) · Wrappers disponíveis em [worker-ask-router](https://github.com/vitorcamillo/worker-ask-router).
+O `git-revisor` adiciona revisão automatizada de commits por IA aos hooks do Git. Ele atende desenvolvedores que querem barrar pushes com defeito antes de enviar, e combina checks determinísticos com revisão de diff e correção isolada em worktree.
 
 ![Demonstração do git-revisor](docs/demo.png)
 
 *O git-revisor barrando um push: os testes falham e o commit fica reprovado até ser corrigido.*
 
-O `git-revisor` adiciona revisão automatizada de commits por IA aos hooks do Git. Ele ajuda a encontrar problemas antes de enviar mudanças, combina revisão de diff com checks determinísticos e pode bloquear um push reprovado. Se a revisão reprovar, pode pedir a um worker externo que proponha uma correção em um worktree e submeter a alteração novamente à revisão.
+## Sumário
 
-## Como funciona
+- [Recursos](#recursos)
+- [Início rápido](#início-rápido)
+- [Uso](#uso)
+- [Configuração](#configuração)
+- [Como funciona](#como-funciona)
+- [Limitações e uso responsável](#limitações-e-uso-responsável)
+- [Contribuição](#contribuição)
+- [Licença](#licença)
 
-- Os hooks de commit e push chamam o revisor. No push, os commits ainda não aprovados são revisados antes do envio; uma reprovação bloqueia o push.
-- Checks determinísticos, como testes e lint, rodam em worktrees do commit. Por padrão, o projeto tenta detectar testes conhecidos; também é possível configurar comandos por repositório. Uma falha de check reprova a mudança.
-- Mudanças classificadas como baixo risco podem passar sem revisão de IA, mas os checks configurados ou detectados continuam sendo considerados.
-- Quando há reprovação, o worker pode preparar uma correção isolada em worktree. A correção também passa pelos checks e por uma revisão independente antes de ser aceita.
-- Critérios de aceite: uma seção `Aceite:` no corpo da mensagem do commit (cabeçalho sozinho na linha, itens `1.`, `1)`, `-` ou `*`, linha em branco encerra) é entregue ao revisor de IA. Critério não atendido pelo diff reprova o push e o relatório traz `ACEITE: atendidos/total`. Limites: mudança só de baixo risco não passa pela IA, e em diff dividido em várias partes só é reprovado o critério que alguma parte contraria.
-- Commits grandes demais para revisão automática podem exigir revisão manual. Consulte `git revisor status` para ver o estado e os relatórios disponíveis.
+## Recursos
 
-As decisões automáticas não substituem a revisão humana. Confira o diff, os resultados dos checks e qualquer correção proposta antes de considerar a mudança pronta.
+- Bloqueia o push de commits reprovados antes que o defeito chegue ao remoto.
+- Roda testes e lint em worktrees do commit, sem tocar na árvore de trabalho.
+- Detecta comandos de teste de projetos pytest, Maven, npm, Go e Cargo.
+- Encaminha a correção a um worker externo em worktree isolado quando há reprovação.
+- Submete toda correção aos mesmos checks e a uma nova revisão antes de aceitar.
+- Libera mudanças só de documentação e arquivos gerados sem chamar a IA.
+- Expõe estado e relatórios por `git revisor status` para auditoria posterior.
 
-## Requisitos
+## Início rápido
+
+Requisitos:
 
 - Linux com Python 3.10 ou mais recente e Git.
-- Bash, `readlink`, `flock` e o módulo `fcntl` do Python, usado para locks no Linux.
-- Os wrappers externos de IA usados pela configuração: por padrão, `codex-ask` para revisar e `zcode-worker`, `muse-ask`, `codex-ask` ou `claude-ask` como workers em sequência de fallback.
+- Bash, `readlink` e `flock` disponíveis no `PATH`.
+- Wrappers externos de IA instalados e configurados no `PATH`: `codex-ask` como revisor e, em sequência de fallback, `zcode-worker`, `muse-ask`, `codex-ask` e `claude-ask` como workers. Wrappers disponíveis em [worker-ask-router](https://github.com/vitorcamillo/worker-ask-router).
 
-Esses wrappers precisam estar instalados, configurados e acessíveis no `PATH` (ou apontados pelas variáveis `REVISOR_CMD_*`). O git-revisor depende deles para revisão e correção por IA: não fornece modelos locais gratuitos nem funciona sem um revisor externo disponível. O uso pode enviar diffs e contexto do repositório ao provedor configurado e pode gerar custos conforme a conta, o modelo e as políticas desse provedor. Verifique as condições de privacidade e cobrança antes de habilitar os hooks.
-
-## Instalação
+Clone e prepare o ambiente:
 
 ```bash
 git clone https://github.com/vitorcamillo/git-revisor.git
@@ -43,11 +51,11 @@ python -m pip install -r requirements-dev.txt
 
 Para instalar os hooks e o comando `git revisor`:
 
+> **Atenção:** `instalar` configura `core.hooksPath` na configuração global do Git e cria links para os hooks e para `~/.local/bin/git-revisor`. Se `core.hooksPath` global já estiver configurado para outro caminho, a instalação para sem sobrescrevê-lo.
+
 ```bash
 python3 git_revisor.py instalar
 ```
-
-**Atenção:** `instalar` configura `core.hooksPath` na configuração global do Git e cria links para os hooks e para `~/.local/bin/git-revisor`. Se `core.hooksPath` global já estiver configurado para outro caminho, a instalação para sem sobrescrevê-lo. A instalação não deve ser executada sem entender esse efeito global.
 
 Confira a instalação e o estado no repositório:
 
@@ -62,21 +70,98 @@ Para desligar o revisor apenas no repositório atual:
 git revisor desligar
 ```
 
-Para remover a instalação global criada pelo comando `instalar`:
+## Uso
+
+Todos os comandos usam a forma `git revisor <subcomando>`, resolvida pelo executável `git-revisor` instalado em `~/.local/bin`.
+
+| Comando | Efeito |
+| --- | --- |
+| `revisar <sha>` | Revisa o commit (e o lote pendente) imediatamente. |
+| `revisar-adiado <sha>` | Aguarda o debounce e revisa, ignorando commits já cobertos por um commit mais novo. |
+| `corrigir <sha>` | Executa o fluxo de correção do worker em primeiro plano. |
+| `corrigir-push <sha>` | Executa a correção de um push em segundo plano. |
+| `retentar-push <sha>` | Aguarda a máquina liberar e reenvia um push segurado por infra ou lock. |
+| `suite-completa <sha>` | Roda a suíte completa da árvore em segundo plano. |
+| `pendentes` | Re-revisa os commits que ficaram inconclusivos. |
+| `status [<sha>]` | Mostra o resumo do repositório ou o relatório de um commit. |
+| `ligar` | Ativa o revisor neste repositório (`revisor.enabled=true`). |
+| `desligar` | Desativa o revisor neste repositório (`revisor.enabled=false`). |
+| `instalar` | Instala os hooks globais e o comando `git-revisor`. |
+| `desinstalar` | Remove os hooks e o comando criados pelo `instalar`. |
+| `limpar` | Arquiva as branches `revisor/*` e apaga tentativas antigas. |
+
+Exemplos:
 
 ```bash
-git revisor desinstalar
+git revisor revisar HEAD
+git revisor status
+git revisor status abc1234
+REVISOR_PULAR=1 git push
 ```
 
-`desinstalar` remove `core.hooksPath` global quando ele aponta para a pasta gerenciada pelo git-revisor, além dos links que o instalador criou.
+## Configuração
 
-## Configuração de comandos externos
+Os comandos externos de IA podem ser substituídos por variáveis de ambiente `REVISOR_CMD_*`. Não coloque tokens ou segredos em arquivos versionados.
 
-Os comandos padrão podem ser substituídos por variáveis de ambiente `REVISOR_CMD_*`. Por exemplo, `REVISOR_CMD_REVISAR` escolhe o revisor, `REVISOR_CMD_WORKER` escolhe o primeiro worker e há variáveis próprias para os workers de fallback e para o comando `gitleaks`. Configure os executáveis conforme a documentação dos wrappers instalados; não coloque tokens ou segredos em arquivos versionados.
+| Variável | Padrão | Efeito |
+| --- | --- | --- |
+| `REVISOR_CMD_REVISAR` | `codex-ask` | Revisor que analisa o diff. |
+| `REVISOR_CMD_WORKER` | `zcode-worker --model GLM-5.3 --effort max --timeout 1500` | Primeiro worker da cadeia de correção. |
+| `REVISOR_CMD_WORKER_MUSE` | `muse-ask --model muse-wonder-1.0 --effort max --timeout 1500` | Worker seguinte na cadeia de correção. |
+| `REVISOR_CMD_GITLEAKS` | `gitleaks` | Detector de segredos; sem ele no `PATH`, o pre-push segue. |
+| `REVISOR_PULAR` | — | Com `1`, envia o push sem revisão. |
+| `REVISOR_SEM_CORRECAO` | — | Com `1`, o push interno não corrige de novo. |
+| `REVISOR_TEMPO_REVISOR` | `1500` | Timeout em segundos das chamadas ao revisor. |
+| `REVISOR_TEMPO_WORKER` | `1800` | Timeout em segundos das chamadas ao worker. |
 
-Os checks determinísticos podem ser definidos na configuração local do Git usando `revisor.check`; sem configuração manual, a detecção automática procura projetos com pytest, Maven, npm, Go ou Cargo. A configuração é local ao repositório e pode executar comandos do próprio projeto nos worktrees. Revise esses comandos antes de habilitar checks em código que não conhece.
+Os checks determinísticos e o comportamento por repositório saem da configuração local do Git (`git config`). Sem `revisor.check` configurado, a detecção automática procura projetos pytest, Maven, npm, Go e Cargo.
 
-## Contribuir
+| Chave | Padrão | Efeito |
+| --- | --- | --- |
+| `revisor.enabled` | `true` | Com `false`, desliga tudo neste repositório. |
+| `revisor.check` | — | Comandos determinísticos (vários valores), rodados em worktree do commit; falha reprova a mudança. |
+| `revisor.checkTimeout` | `1200` | Segundos por comando de check. |
+| `revisor.checkRapido` | `true` | Filtro rápido antes da IA; com `false`, o filtro é desligado. |
+| `revisor.checkFinal` | `completo` | Com `selecionado`, o check final roda só os testes ligados ao diff. |
+| `revisor.autoCheck` | `true` | Com `false`, desliga a detecção automática de testes. |
+| `revisor.ordem` | `ia-primeiro` | Com `check-primeiro`, o check completo roda antes da IA. |
+| `revisor.autopush` | `false` | Com `true`, empurra sozinho após aprovar ou aplicar a correção. |
+| `revisor.segundoPlano` | `false` | Com `true`, cada commit é revisado ao ser criado; senão, só no push. |
+| `revisor.baixoRisco` / `revisor.altoRisco` | — | Globs extras que se somam às listas internas de triagem por risco. |
+| `revisor.rodadas` | `2` | Máximo de tentativas de correção do worker. |
 
-Veja [CONTRIBUTING.md](CONTRIBUTING.md) para executar a suíte, relatar problemas e propor mudanças.
+Exemplos:
 
+```bash
+git config --add revisor.check "pytest -q"
+git config revisor.checkTimeout 600
+git config revisor.checkFinal selecionado
+git config revisor.autopush true
+```
+
+## Como funciona
+
+- Os hooks de commit e push chamam o revisor. No push, os commits ainda não aprovados são revisados antes do envio; uma reprovação bloqueia o push.
+- Checks determinísticos, como testes e lint, rodam em worktrees do commit. Por padrão, o projeto tenta detectar testes conhecidos; também é possível configurar comandos por repositório. Uma falha de check reprova a mudança.
+- Mudanças classificadas como baixo risco podem passar sem revisão de IA, mas os checks configurados ou detectados continuam sendo considerados.
+- Quando há reprovação, o worker prepara uma correção isolada em worktree. A correção também passa pelos checks e por uma revisão independente antes de ser aceita.
+- O pre-push também bloqueia o envio quando o `gitleaks` encontra possível segredo no histórico do push.
+- Critérios de aceite: uma seção `Aceite:` no corpo da mensagem do commit (cabeçalho sozinho na linha, itens `1.`, `1)`, `-` ou `*`, linha em branco encerra) é entregue ao revisor de IA. Critério não atendido pelo diff reprova o push e o relatório traz `ACEITE: atendidos/total`. Limites: mudança só de baixo risco não passa pela IA, e em diff dividido em várias partes só é reprovado o critério que alguma parte contraria.
+- Commits grandes demais para revisão automática exigem revisão manual. Consulte `git revisor status` para ver o estado e os relatórios disponíveis.
+
+## Limitações e uso responsável
+
+- O git-revisor depende dos wrappers externos para revisão e correção por IA: não fornece modelos locais gratuitos nem funciona sem um revisor externo disponível.
+- O uso pode enviar diffs e contexto do repositório ao provedor configurado e pode gerar custos conforme a conta, o modelo e as políticas desse provedor. Verifique as condições de privacidade e cobrança antes de habilitar os hooks.
+- As decisões automáticas não substituem a revisão humana. Confira o diff, os resultados dos checks e qualquer correção proposta antes de considerar a mudança pronta.
+- Mudanças grandes demais para revisão automática não são aprovadas pela ferramenta; revise manualmente ou envie com `REVISOR_PULAR=1 git push`.
+- A configuração é local ao repositório e pode executar comandos do próprio projeto nos worktrees. Revise esses comandos antes de habilitar checks em código que não conhece.
+- Antes de publicar logs, relatórios ou diffs, remova tokens, URLs privadas, nomes de clientes e dados pessoais.
+
+## Contribuição
+
+Contribuições são bem-vindas: veja [CONTRIBUTING.md](CONTRIBUTING.md) para preparar o ambiente, executar a suíte com `python -m pytest -q` e abrir issues e pull requests.
+
+## Licença
+
+Distribuído sob a [licença MIT](LICENSE).
