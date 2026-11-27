@@ -3598,17 +3598,18 @@ def chave_parte(parte: str, risco_alto: list[str] | None,
     Exceção: os critérios de aceite (`aceite_da_intencao`) entram na chave
     quando existem, porque mudam o que o revisor cobra; sem critérios a
     chave é a mesma de antes. Havendo critérios, o modo multipartes também
-    entra (`multipartes=True`): numa parte o revisor pode não verificar
-    critério que esteja em outra parte, aprovação mais fraca que a do diff
-    completo com o mesmo texto, e as duas não compartilham cache.
+    entra explicitamente (`multipartes=True` ou `False`): numa parte o
+    revisor pode não verificar critério que esteja em outra parte, aprovação
+    mais fraca que a do diff completo com o mesmo texto, e as duas não
+    compartilham cache. Registrar `False` invalida aprovações gravadas sem
+    esse campo (ex.: parte multipartes antiga reutilizada como completa).
     """
     dados = {"parte": parte, "risco": sorted(risco_alto or []),
              "contexto_repo": contexto_repo or "",
              "versao": VERSAO_CACHE_PARTE}
     if aceite:
         dados["aceite"] = aceite
-        if multipartes:
-            dados["multipartes"] = True
+        dados["multipartes"] = multipartes
     return hashlib.sha256(json.dumps(
         dados, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 

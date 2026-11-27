@@ -5,7 +5,9 @@ Seguem o estilo de `test_git_revisor_r12.py` (importar o módulo como
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 
@@ -357,6 +359,54 @@ def test_chave_parte_multipartes_so_com_aceite() -> None:
         "DIFF", None, None, "1. regra a", multipartes=False) == completo
     assert mod.chave_parte(
         "DIFF", None, None, "1. regra a", multipartes=True) != completo
+
+
+def _chave_legada_sem_multipartes(parte: str, aceite: str) -> str:
+    """Chave gravada antes do campo `multipartes` (sem ele no payload)."""
+    dados = {"parte": parte, "risco": [], "contexto_repo": "",
+             "versao": mod.VERSAO_CACHE_PARTE, "aceite": aceite}
+    return hashlib.sha256(json.dumps(
+        dados, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def test_chave_completa_com_aceite_invalida_cache_antigo() -> None:
+    """Migração: chave completa nova difere da legada sem `multipartes`."""
+    legada = _chave_legada_sem_multipartes("DIFF", "1. regra a")
+    assert mod.chave_parte(
+        "DIFF", None, None, "1. regra a", multipartes=False) != legada
+    assert mod.chave_parte(
+        "DIFF", None, None, "1. regra a", multipartes=True) != legada
+
+
+def test_cache_antigo_multipartes_nao_aprova_diff_completo(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Aprovação legada (sem `multipartes`) não é reusada como completa."""
+    intencao = f"feat: x\n{mod.MARCADOR_ACEITE}\n1. [abc1234] regra a"
+    aceite = mod.aceite_da_intencao(intencao)
+    texto = "diff pequeno"
+    cache: dict[str, str] = {
+        _chave_legada_sem_multipartes(texto, aceite): "codex"}
+    chamadas: list[str] = []
+    monkeypatch.setattr(mod, "cache_parte_ativo", lambda topo=None: True)
+    monkeypatch.setattr(mod, "cache_veredito_ativo", lambda topo=None: True)
+    monkeypatch.setattr(mod, "ler_cache_parte", lambda chave: cache.get(chave))
+    monkeypatch.setattr(
+        mod, "gravar_cache_parte",
+        lambda chave, resumo: cache.__setitem__(chave, "codex"))
+    monkeypatch.setattr(
+        mod, "cfg",
+        lambda chave, padrao: padrao if chave == "maxPartes" else "1")
+    monkeypatch.setattr(mod, "familia_revisor", lambda saida: "codex")
+
+    def falso(prompt: str, cwd: str) -> tuple[str, str]:
+        chamadas.append(prompt)
+        return "APROVADO", "ok"
+
+    monkeypatch.setattr(mod, "revisar_com_ia", falso)
+    veredito, _, _ = mod.revisar_por_partes(
+        texto, "repo", "abc1234", intencao=intencao)
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 1
 
 
 def test_parte_multipartes_nao_reaproveitada_como_diff_completo(
