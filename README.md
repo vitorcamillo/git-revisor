@@ -18,6 +18,7 @@ O `git-revisor` adiciona revisão automatizada de commits por IA aos hooks do Gi
 - Checks determinísticos, como testes e lint, rodam em worktrees do commit. Por padrão, o projeto tenta detectar testes conhecidos; também é possível configurar comandos por repositório. Uma falha de check reprova a mudança.
 - Mudanças classificadas como baixo risco podem passar sem revisão de IA, mas os checks configurados ou detectados continuam sendo considerados.
 - Quando há reprovação, o worker pode preparar uma correção isolada em worktree. A correção também passa pelos checks e por uma revisão independente antes de ser aceita.
+- Critérios de aceite: uma seção `Aceite:` no corpo da mensagem do commit (cabeçalho sozinho na linha, itens `1.`, `1)`, `-` ou `*`, linha em branco encerra) é entregue ao revisor de IA. Critério não atendido pelo diff reprova o push e o relatório traz `ACEITE: atendidos/total`. Limites: mudança só de baixo risco não passa pela IA, e em diff dividido em várias partes só é reprovado o critério que alguma parte contraria.
 - Commits grandes demais para revisão automática podem exigir revisão manual. Consulte `git revisor status` para ver o estado e os relatórios disponíveis.
 
 As decisões automáticas não substituem a revisão humana. Confira o diff, os resultados dos checks e qualquer correção proposta antes de considerar a mudança pronta.
