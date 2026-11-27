@@ -7413,7 +7413,9 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
             relatorio = _gravar_relatorio_qa(
                 sha, "INDISPONIVEL",
                 ("verificador indisponível "
-                 f"(exit {codigo_ver}); achados sem confirmação"),
+                 f"(exit {codigo_ver}); achados sem confirmação"
+                 + (f"\nCOBERTO: {interp['coberto']}"
+                    if interp.get("coberto") else "")),
                 interp["aceite"] or aceite, estados)
             log(f"qa: INDISPONIVEL {sha7(sha)} verificador indisponível")
             return 0

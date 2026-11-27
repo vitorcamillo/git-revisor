@@ -257,6 +257,7 @@ def test_verificador_indisponivel(
     qa = _stub(tmp_path / "qa.sh",
                'printf "%s\\n" "- [ALTA] bug — ruim — corrija" '
                '"PROVA: curl http://localhost:9/ => 500" '
+               '"COBERTO: tela inicial e busca vazia" '
                '"QA: REPROVADO"\n')
     ver = _stub(tmp_path / "ver.sh", "exit 1\n")
     monkeypatch.setenv("REVISOR_CMD_QA", qa)
@@ -266,6 +267,7 @@ def test_verificador_indisponivel(
         encoding="utf-8")
     assert "QA: INDISPONIVEL" in relatorio
     assert "NAO_VERIFICADO" in relatorio
+    assert "COBERTO: tela inicial e busca vazia" in relatorio
 
 
 # --------------------------------- critério 9 (veredito, notificar, baixa)
