@@ -165,7 +165,7 @@ git config revisor.qa false
 
 (`REVISOR_QA=0` in the environment also turns it off.)
 
-Without `revisor.qaPronto`, the script's `ESPERA: <seconds>` line becomes the wait before QA, counted from the start of the run (`REVISOR_QA_ESPERA` ceiling); with `qaPronto`, the current wait for the remote and for readiness applies.
+Waiting for the remote to contain the commit always applies (`REVISOR_QA_ESPERA` ceiling). Without `revisor.qaPronto`, the remainder of the script's `ESPERA: <seconds>` line then applies, counted from the start of the run; with `qaPronto`, readiness is also awaited (and `ESPERA:` does not count).
 
 Optional: a versioned `.revisor/qa-armadilhas.md` lists known false positives; the QA learns more on its own in `.git/revisor/qa/armadilhas.md`.
 

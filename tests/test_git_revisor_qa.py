@@ -702,6 +702,14 @@ def test_geracao_gravada_com_cabecalho_e_reusada(
     assert len(contador.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_gravar_roteiro_local_atomico(repo: Path) -> None:
+    """A gravação do roteiro local não deixa `.tmp` para trás."""
+    mod.gravar_roteiro_qa_local(_roteiro_valido())
+    caminho = mod.caminho_roteiro_qa_local()
+    assert "http://localhost:3000/" in caminho.read_text(encoding="utf-8")
+    assert not (caminho.parent / (caminho.name + ".tmp")).exists()
+
+
 def test_roteiro_invalido_indisponivel_sem_gravar(
         repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         sem_espera: None) -> None:
@@ -773,6 +781,23 @@ def test_interpretar_roteiro_qa() -> None:
     assert mod.interpretar_roteiro_qa("ESPERA: 10\nsem url")[0] == "invalido"
     assert mod.interpretar_roteiro_qa(
         "http://x sem espera")[0] == "invalido"
+
+
+def test_interpretar_roteiro_host_externo_avisa(repo: Path) -> None:
+    """Host fora de localhost no roteiro gerado avisa no log (não recusa)."""
+    tipo, _corpo, _espera = mod.interpretar_roteiro_qa(
+        "alvos: https://exemplo.invalid/\n- j1\nESPERA: 0\n")
+    assert tipo == "roteiro"
+    assert "host externo" in _log()
+    assert "exemplo.invalid" in _log()
+
+
+def test_interpretar_roteiro_localhost_nao_avisa(repo: Path) -> None:
+    """Roteiro só com localhost não gera aviso de host externo."""
+    tipo, _corpo, _espera = mod.interpretar_roteiro_qa(
+        "alvos: http://localhost:3000/\n- j1\nESPERA: 0\n")
+    assert tipo == "roteiro"
+    assert "host externo" not in _log()
 
 
 def test_geracao_usa_cwd_do_topo_e_prompt_fixo(
@@ -859,6 +884,37 @@ def test_marcador_vivo_impede_disparo_e_loga_uma_vez(
     mod.disparar_qa([sha], sha, str(repo), base, "origin",
                     "refs/heads/main")
     assert _log().count("qa: pulado (sem alvo)") == 1
+
+
+def test_marcador_vivo_com_roteiro_local_dispara(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Marcador vivo não segura o disparo quando há roteiro local."""
+    base = _commit(repo, {"app.py": "print(1)\n"}, "feat: base")
+    sha = _commit(repo, {"app.py": "print(2)\n"}, "feat: app")
+    mod.gravar_sem_alvo_qa("só biblioteca")
+    (mod.base_dir() / "qa" / "roteiro.md").write_text(
+        _roteiro_valido(), encoding="utf-8")
+    comandos: list[list[str]] = []
+
+    class _ProcFalso:
+        pid = 424243
+
+    popen_real = subprocess.Popen
+
+    def popen_falso(cmd: list[str],
+                    **kwargs) -> _ProcFalso | subprocess.Popen:
+        if cmd and cmd[0] == "git":
+            return popen_real(cmd, **kwargs)
+        comandos.append(cmd)
+        return _ProcFalso()
+
+    monkeypatch.setattr(mod.subprocess, "Popen", popen_falso)
+    mod.disparar_qa([sha], sha, str(repo), base, "origin",
+                    "refs/heads/main")
+    assert (_base_dir() / "qa-fundo.json").exists()
+    assert comandos and comandos[0][-2:] == ["qa", sha]
+    assert "qa cliente disparado" in _log()
+    assert "qa: pulado (sem alvo)" not in _log()
 
 
 def test_marcador_vencido_apagado_e_gera_de_novo(
@@ -959,6 +1015,68 @@ def test_qaPronto_ignora_espera_do_roteiro(
     assert dormiu == []
     assert "QA: APROVADO" in (_base_dir() / "qa" / f"{sha}.md").read_text(
         encoding="utf-8")
+
+
+def _remoto_local(tmp_path: Path, repo: Path) -> str:
+    """Cria o remoto local `origin` (bare) e devolve a ref da branch."""
+    bare = tmp_path / "origem.git"
+    _git(tmp_path, "init", "--bare", "-q", str(bare))
+    _git(repo, "remote", "add", "origin", str(bare))
+    ramo = _git(repo, "branch", "--show-current").stdout.strip()
+    return f"refs/heads/{ramo}"
+
+
+def _fundo_com_remoto(sha: str, ref: str) -> None:
+    """Registra o fundo do QA apontando para o remoto `origin`."""
+    fundo = _base_dir() / "qa-fundo.json"
+    fundo.parent.mkdir(parents=True, exist_ok=True)
+    fundo.write_text(json.dumps({"sha": sha, "novos": [sha],
+                                 "remote": "origin",
+                                 "remote_ref": ref}) + "\n",
+                     encoding="utf-8")
+
+
+def test_sem_qaPronto_espera_remoto_conter_sha(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sem `qaPronto`, o QA não roda antes de o remoto conter o sha."""
+    _commit(repo, {"app.py": "x = 1\n"}, "feat: base")
+    ref = _remoto_local(tmp_path, repo)
+    _git(repo, "push", "-q", "origin", "HEAD")  # remoto só tem a base
+    sha = _liga_qa(repo)  # sha novo, ainda fora do remoto
+    _fundo_com_remoto(sha, ref)
+    monkeypatch.setenv("REVISOR_QA_ESPERA", "2")
+    monkeypatch.setenv("REVISOR_QA_INTERVALO", "0.1")
+    marcador = tmp_path / "qa-chamado"
+    qa = _stub(tmp_path / "qa.sh",
+               f'touch "{marcador}"\nprintf "%s\\n" "QA: APROVADO"\n')
+    monkeypatch.setenv("REVISOR_CMD_QA", qa)
+    assert mod.cmd_qa(sha) == 0
+    assert not marcador.exists()
+    relatorio = (_base_dir() / "qa" / f"{sha}.md").read_text(
+        encoding="utf-8")
+    assert "QA: PULADO" in relatorio
+    assert "remoto sem" in relatorio
+
+
+def test_sem_qaPronto_com_remoto_atualizado_roda_qa(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sem `qaPronto`, com o sha já no remoto, o QA roda normalmente."""
+    sha = _liga_qa(repo)
+    ref = _remoto_local(tmp_path, repo)
+    _git(repo, "push", "-q", "origin", "HEAD")
+    _fundo_com_remoto(sha, ref)
+    monkeypatch.setenv("REVISOR_QA_ESPERA", "5")
+    monkeypatch.setenv("REVISOR_QA_INTERVALO", "0.1")
+    marcador = tmp_path / "qa-chamado"
+    qa = _stub(tmp_path / "qa.sh",
+               f'touch "{marcador}"\n'
+               'printf "%s\\n" "ACEITE: 1/1" "QA: APROVADO"\n')
+    monkeypatch.setenv("REVISOR_CMD_QA", qa)
+    assert mod.cmd_qa(sha) == 0
+    assert marcador.exists()
+    relatorio = (_base_dir() / "qa" / f"{sha}.md").read_text(
+        encoding="utf-8")
+    assert "QA: APROVADO" in relatorio
 
 
 # ------------------------------------------------- critérios 7 e 8

@@ -6548,15 +6548,23 @@ def ler_roteiro_qa_local() -> str | None:
 
 
 def gravar_roteiro_qa_local(corpo: str) -> None:
-    """Grava o roteiro gerado com cabeçalho (editável/substituível)."""
-    pasta = caminho_roteiro_qa_local().parent
+    """Grava o roteiro gerado com cabeçalho (editável/substituível).
+
+    Gravação atômica (`.tmp` + `os.replace`), como a do marcador
+    sem-alvo: execução concorrente ou interrompida nunca deixa um
+    roteiro truncado para ser lido como local.
+    """
+    caminho = caminho_roteiro_qa_local()
+    pasta = caminho.parent
     pasta.mkdir(parents=True, exist_ok=True)
     cabecalho = ("# Roteiro gerado automaticamente "
                  f"em {agora_iso()}\n"
                  "# Editável: ajuste à vontade ou substitua por "
                  "`.revisor/qa.md` versionado (que tem prioridade).\n\n")
-    caminho_roteiro_qa_local().write_text(
-        cabecalho + corpo.strip() + "\n", encoding="utf-8")
+    temporario = pasta / (caminho.name + ".tmp")
+    temporario.write_text(cabecalho + corpo.strip() + "\n",
+                          encoding="utf-8")
+    os.replace(temporario, caminho)
 
 
 def gravar_sem_alvo_qa(motivo: str) -> None:
@@ -6655,13 +6663,38 @@ def gerar_roteiro_qa(topo: str) -> str | None:
     return saida
 
 
+def _hosts_externos_qa(texto: str) -> list[str]:
+    """Hosts http(s) do texto fora de localhost (ordem de aparição).
+
+    O roteiro gerado nasce de conteúdo do repositório (que pode ter
+    sido escrito por terceiros): host externo não é prova de problema
+    — o produto pode ser publicado —, mas é sinal para conferir.
+    """
+    externos: list[str] = []
+    for url in QA_URL_RE.findall(texto or ""):
+        resto = url.split("://", 1)[-1]
+        resto = resto.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        resto = resto.rsplit("@", 1)[-1]
+        if resto.startswith("["):
+            fim = resto.find("]")
+            host = resto[1:fim] if fim > 0 else resto
+        else:
+            host = resto.split(":", 1)[0]
+        host = host.lower().rstrip(".")
+        if (host and host not in ("localhost", "127.0.0.1", "::1")
+                and host not in externos):
+            externos.append(host)
+    return externos
+
+
 def interpretar_roteiro_qa(texto: str) -> tuple[str, str, int | None]:
     """Classifica a saída do gerador: `sem-alvo`, `roteiro` ou `invalido`.
 
     Devolve (tipo, corpo, espera): `sem-alvo` traz o motivo; `roteiro`
     (com `ESPERA:` e ao menos uma URL http(s)) traz os segundos; o
     resto é `invalido` (nada é executado a partir do roteiro: só essas
-    linhas são lidas).
+    linhas são lidas). Roteiro com host fora de localhost apenas avisa
+    no log — o alvo pode ser o produto publicado —, sem recusar.
     """
     # o bloco JSON do contrato do wrapper não faz parte do roteiro
     texto = re.sub(r"```json\b.*?```\s*", "", texto or "", flags=re.DOTALL)
@@ -6675,6 +6708,11 @@ def interpretar_roteiro_qa(texto: str) -> tuple[str, str, int | None]:
             espera = max(0, int(espera_m.group(1)))
         except ValueError:
             return ("invalido", "", None)
+        externos = _hosts_externos_qa(texto)
+        if externos:
+            log("qa: roteiro gerado cita host externo ("
+                + ", ".join(externos)
+                + "); confira se é do próprio projeto antes do QA")
         # corta o que vier depois da linha ESPERA (rodapé/contrato do wrapper)
         return ("roteiro", texto[:texto.find("\n", espera_m.end()) if
                                  "\n" in texto[espera_m.end():]
@@ -6986,10 +7024,10 @@ def disparar_qa(novos: list[str], local_sha: str, topo: str, base: str,
     Nada dispara com `revisor.qa false` ou `REVISOR_QA=0`; a ausência
     de `.revisor/qa.md` não impede (o roteiro pode ser gerado no `qa`).
     Push de risco baixo não dispara (só loga). Com marcador sem-alvo
-    vivo e sem roteiro versionado, nem dispara (loga no máximo uma vez
-    por dia); marcador vencido é apagado e a geração roda de novo no
-    `qa`. Mesma árvore viva não duplica; sha novo encerra a execução
-    anterior de outro sha. Falha ao disparar só loga.
+    vivo e sem roteiro versionado nem local, nem dispara (loga no
+    máximo uma vez por dia); marcador vencido é apagado e a geração
+    roda de novo no `qa`. Mesma árvore viva não duplica; sha novo
+    encerra a execução anterior de outro sha. Falha ao disparar só loga.
     """
     if not novos:
         return
@@ -7000,7 +7038,8 @@ def disparar_qa(novos: list[str], local_sha: str, topo: str, base: str,
     if git(["show", f"{local_sha}:.revisor/qa.md"],
            cwd=topo).returncode != 0:
         estado_alvo = qa_sem_alvo_estado()
-        if estado_alvo == "vivo":
+        if (estado_alvo == "vivo"
+                and ler_roteiro_qa_local() is None):
             qa_log_sem_alvo()
             return
         if estado_alvo == "expirado":
@@ -7248,9 +7287,11 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
                  rodada: int, inicio: float | None = None) -> int:
     """Corpo do `cmd_qa` (separado para o finally limpar o registro).
 
-    `inicio` é o monotonic do início do `cmd_qa`: sem `qaPronto`, a
-    espera do `ESPERA:` do roteiro é contada a partir dele. Com
-    `qaPronto`, vale a espera atual (remoto + prontidão).
+    `inicio` é o monotonic do início do `cmd_qa`. A espera pelo
+    remoto (teto `REVISOR_QA_ESPERA`) vale sempre; sem `qaPronto`,
+    depois dela aplica-se o restante do `ESPERA:` do roteiro, contado
+    de `inicio`. Com `qaPronto`, espera-se também a prontidão (e o
+    `ESPERA:` não conta).
     """
     if inicio is None:
         inicio = time.monotonic()
@@ -7267,12 +7308,10 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
     if estado != "ok" or not roteiro:
         return _qa_sem_veredito(sha, "INDISPONIVEL", motivo, aceite)
     assert origem in ("versionado", "local", "gerado")
-    if cfg("qaPronto", ""):
-        ok, motivo_espera = _esperar_qa_liberar(sha, topo, remote,
-                                               remote_ref)
-        if not ok:
-            return _qa_sem_veredito(sha, "PULADO", motivo_espera, aceite)
-    else:
+    ok, motivo_espera = _esperar_qa_liberar(sha, topo, remote, remote_ref)
+    if not ok:
+        return _qa_sem_veredito(sha, "PULADO", motivo_espera, aceite)
+    if not cfg("qaPronto", ""):
         espera_m = QA_ESPERA_RE.search(roteiro or "")
         espera = 0
         if espera_m is not None:

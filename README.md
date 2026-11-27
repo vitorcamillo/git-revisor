@@ -167,7 +167,7 @@ git config revisor.qa false
 
 (`REVISOR_QA=0` no ambiente também desliga.)
 
-Sem `revisor.qaPronto`, a linha `ESPERA: <segundos>` do roteiro vira espera antes do QA, contada do início da execução (teto `REVISOR_QA_ESPERA`); com `qaPronto`, vale a espera atual pelo remoto e pela prontidão.
+A espera pelo remoto conter o commit vale sempre (teto `REVISOR_QA_ESPERA`). Sem `revisor.qaPronto`, depois dela aplica-se o restante da linha `ESPERA: <segundos>` do roteiro, contada do início da execução; com `qaPronto`, espera-se também a prontidão (e o `ESPERA:` não conta).
 
 Opcional: `.revisor/qa-armadilhas.md` versionado lista falsos positivos conhecidos; o QA aprende outros sozinho em `.git/revisor/qa/armadilhas.md`.
 
