@@ -6434,9 +6434,12 @@ QA_CONTRATO_SAIDA = (
     "- um achado por linha: `- [ALTA|MEDIA|BAIXA] título — problema "
     "— correção sugerida`\n"
     "- logo após cada achado, a prova: `PROVA: <comando reexecutável> "
-    "=> <saída observada>`\n"
+    "=> <saída observada>` (o comando inteiro, que rode em outra "
+    "máquina limpa; nunca um arquivo ou script que você criou)\n"
     "- uma linha `ACEITE: <atendidos>/<total>` com os critérios de "
     "aceite verificados de fora\n"
+    "- uma linha `COBERTO: <o que você percorreu de fato, resumido>` "
+    "(jornadas, telas e tipos de erro forçado)\n"
     "- ÚLTIMA linha exatamente `QA: APROVADO` ou `QA: REPROVADO`.")
 
 
@@ -6837,6 +6840,7 @@ def interpretar_qa(texto: str) -> dict:
     achados: list[dict] = []
     vereditos: list[str] = []
     aceite: str | None = None
+    coberto: str | None = None
     for i, linha in enumerate(linhas):
         m = QA_ACHADO_RE.match(linha)
         if m:
@@ -6859,8 +6863,11 @@ def interpretar_qa(texto: str) -> dict:
         am = ACEITE_RE.match(linha)
         if am:
             aceite = am.group(1)
+        cm = re.match(r"^\s*COBERTO:\s*(.+?)\s*$", linha)
+        if cm:
+            coberto = cm.group(1)[:1500]
     return {"veredito": vereditos[-1] if vereditos else "INDISPONIVEL",
-            "aceite": aceite, "achados": achados}
+            "aceite": aceite, "achados": achados, "coberto": coberto}
 
 
 def montar_prompt_verificacao(achados: list[dict]) -> str:
@@ -7151,8 +7158,24 @@ def _remoto_contem(remote: str, remote_ref: str, sha: str,
         return False
     if p.returncode != 0:
         return False
-    return any(linha.split()[0] == sha
-               for linha in p.stdout.splitlines() if linha.split())
+    pontas = [linha.split()[0] for linha in p.stdout.splitlines()
+              if linha.split()]
+    if sha in pontas:
+        return True
+    # Outro push já entrou por cima: o sha está no remoto se for ancestral
+    # da ponta anunciada (busca a ponta sem mexer em ref nem FETCH_HEAD).
+    for ponta in pontas:
+        try:
+            if git(["cat-file", "-e", f"{ponta}^{{commit}}"],
+                   cwd=topo).returncode != 0:
+                git(["fetch", "--quiet", "--no-write-fetch-head", remote,
+                     ponta], cwd=topo, timeout=timeout)
+            if git(["merge-base", "--is-ancestor", sha, ponta],
+                   cwd=topo).returncode == 0:
+                return True
+        except (subprocess.SubprocessError, OSError):
+            continue
+    return False
 
 
 def _qa_pronto_ok(sha: str, topo: str,
@@ -7417,7 +7440,9 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
     relatorio = _gravar_relatorio_qa(
         sha, veredito,
         (f"{len(graves)} achado(s) confirmado(s) ALTA/MEDIA"
-         if graves else "nenhum achado confirmado ALTA/MEDIA"),
+         if graves else "nenhum achado confirmado ALTA/MEDIA")
+        + (f"\nCOBERTO: {interp['coberto']}" if interp.get("coberto")
+           else ""),
         interp["aceite"] or aceite, estados)
     log(f"qa: {veredito} {sha7(sha)} "
         f"{len(graves)} grave(s), {len(baixas)} baixa(s)")

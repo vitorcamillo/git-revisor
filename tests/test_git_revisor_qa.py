@@ -312,6 +312,7 @@ def test_so_baixa_aprova_sem_notificar(
     qa = _stub(tmp_path / "qa.sh",
                'printf "%s\\n" "- [BAIXA] texto — erro pequeno — ajuste" '
                '"PROVA: curl http://localhost:9/ => typo" '
+               '"COBERTO: página inicial" '
                '"QA: REPROVADO"\n')
     ver = _stub(tmp_path / "ver.sh",
                 'printf "%s\\n" "- [1] CONFIRMADO: typo visível"\n')
@@ -321,6 +322,7 @@ def test_so_baixa_aprova_sem_notificar(
     relatorio = (_base_dir() / "qa" / f"{sha}.md").read_text(
         encoding="utf-8")
     assert "QA: APROVADO" in relatorio
+    assert "COBERTO: página inicial" in relatorio
     baixa = (_base_dir() / "qa" / "baixa.md").read_text(encoding="utf-8")
     assert "texto" in baixa
     assert "QA cliente:" not in _log()
@@ -1126,3 +1128,68 @@ def test_pasta_estavel_em_repositorio_bare_fica_no_topo(
     wt = tmp_path / "wt-bare"
     _git(bare, "worktree", "add", "-q", "--detach", str(wt))
     assert mod._pasta_estavel_qa(str(wt)) == str(wt)
+
+
+# ---------------- remoto que já andou por cima do sha
+
+def test_remoto_contem_sha_ancestral_da_ponta(
+        repo: Path, tmp_path: Path) -> None:
+    """Outro push entrou por cima: o sha antigo ainda conta como no remoto."""
+    _liga_qa(repo)
+    remoto = tmp_path / "remoto.git"
+    _git(repo, "init", "-q", "--bare", str(remoto))
+    _git(repo, "remote", "add", "origin", str(remoto))
+    ramo = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    ref = f"refs/heads/{ramo}"
+    antigo = _commit(repo, {"a.py": "1\n"}, "feat: a")
+    _git(repo, "push", "-q", "--no-verify", "origin", f"HEAD:{ref}")
+    # um segundo clone empurra por cima (objeto ausente no repo local)
+    outro = tmp_path / "outro"
+    _git(repo, "clone", "-q", str(remoto), str(outro))
+    _git(outro, "config", "user.email", "t@exemplo.invalid")
+    _git(outro, "config", "user.name", "T")
+    _git(outro, "config", "revisor.enabled", "false")
+    (outro / "b.py").write_text("2\n", encoding="utf-8")
+    _git(outro, "add", "b.py")
+    _git(outro, "commit", "-q", "-m", "feat: b")
+    _git(outro, "push", "-q", "--no-verify", "origin", f"HEAD:{ref}")
+    assert mod._remoto_contem("origin", ref, antigo, str(repo))
+    fora = _commit(repo, {"c.py": "3\n"}, "feat: c (nunca empurrado)")
+    assert not mod._remoto_contem("origin", ref, fora, str(repo))
+
+
+def test_disparo_de_worktree_usa_arvore_principal_como_cwd(
+        repo: Path, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """O processo do QA nasce na árvore principal, não na worktree do push."""
+    base = _liga_qa(repo)
+    sha = _commit(repo, {"app.py": "print(1)\n"}, "feat: app")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt))
+    chamadas: list[dict] = []
+
+    class _ProcFalso:
+        pid = 424243
+
+    popen_real = subprocess.Popen
+
+    def popen_falso(cmd: list[str], **kwargs):
+        if cmd and cmd[0] == "git":
+            return popen_real(cmd, **kwargs)
+        chamadas.append(kwargs)
+        return _ProcFalso()
+
+    monkeypatch.setattr(mod.subprocess, "Popen", popen_falso)
+    mod.disparar_qa([sha], sha, str(wt), base, "origin", "refs/heads/main")
+    assert len(chamadas) == 1
+    assert chamadas[0]["cwd"] == str(repo)
+
+
+def test_coberto_e_lido_do_contrato() -> None:
+    """A linha COBERTO do agente é extraída (vai para o relatório)."""
+    interp = mod.interpretar_qa(
+        "COBERTO: home em 375 px, busca vazia e longa\n"
+        "ACEITE: 2/2\nQA: APROVADO\n")
+    assert interp["coberto"] == "home em 375 px, busca vazia e longa"
+    assert mod.interpretar_qa("QA: APROVADO\n")["coberto"] is None
+    assert "COBERTO:" in mod.QA_CONTRATO_SAIDA
