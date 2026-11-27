@@ -1049,8 +1049,13 @@ def aprovado_para(sha: str, ponta: str) -> bool:
 
 
 def marcar_aprovado(sha: str, revisor: str, requer: str | None = None,
-                    familia: str | None = None) -> None:
+                    familia: str | None = None,
+                    herdado_de: str | None = None) -> None:
     """Grava o marcador de aprovação (1 linha JSON) do commit.
+
+    Aprovação incondicional grava também a impressão do patch (ver
+    `gravar_aprovacao_patch`); a herdada (`herdado_de`) não, para a
+    origem continuar sendo o commit que a IA de fato revisou.
 
     Com 'requer', a aprovação só vale para pushes que incluam o commit
     exigido (ver aprovado_para). Marcador incondicional existente nunca
@@ -1067,8 +1072,170 @@ def marcar_aprovado(sha: str, revisor: str, requer: str | None = None,
         dados["requer"] = requer
     if familia:
         dados["familia"] = familia[:200]
+    if herdado_de:
+        dados["herdado_de"] = herdado_de
     (pasta / sha).write_text(json.dumps(dados, ensure_ascii=False) + "\n",
                              encoding="utf-8")
+    if not requer and not herdado_de:
+        gravar_aprovacao_patch(sha, revisor, familia)
+
+
+# ------------------------------------------- aprovação por conteúdo (patch)
+#
+# O marcador de aprovação é por sha, e rebase muda o sha. Para o commit que
+# perdeu a corrida do push e foi rebaseado SEM mudar o conteúdo não voltar à
+# IA, cada aprovação incondicional grava também a impressão do patch do
+# commit; no push seguinte, commit de sha novo com a mesma impressão herda a
+# aprovação (gitleaks e checks rodam de novo na árvore nova). A impressão é
+# mais estrita que `git patch-id`: não ignora espaços, e inclui a mensagem
+# (critérios de aceite). Rebase com conflito resolvido à mão muda a
+# impressão e volta para a revisão.
+
+def aprovacao_por_patch_ativa(topo: str | None = None) -> bool:
+    """`revisor.aprovacaoPorPatch` (padrão true); só `false` desliga."""
+    p = git(["config", "--get", "revisor.aprovacaoPorPatch"], cwd=topo)
+    valor = p.stdout.strip() if p.returncode == 0 else ""
+    return (valor or "true").lower() != "false"
+
+
+def _git_bytes(args: list[str], entrada: bytes | None = None) -> bytes | None:
+    """Saída crua do git (sem trocar byte inválido); None se falhar."""
+    try:
+        p = subprocess.run(["git", *args], check=False, capture_output=True,
+                           input=entrada, timeout=TEMPO_GIT, env=env_limpo())
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def impressao_commit(sha: str) -> tuple[str, str] | None:
+    """(impressão, patch-id) do conteúdo do commit; None se não é herdável.
+
+    A impressão é o sha256 do patch do commit contra o pai único, sem as
+    linhas `index` e sem os números de linha dos hunks (mudam no rebase
+    limpo), mais a mensagem. Contexto e linhas alteradas entram byte a
+    byte. Merge, commit raiz, patch vazio ou falha do git não têm
+    impressão: fail-closed, o commit segue para a revisão normal.
+    """
+    pais = _git_bytes(["rev-list", "--parents", "-n", "1", sha])
+    if pais is None or len(pais.split()) != 2:
+        return None
+    patch = _git_bytes(["diff-tree", "-p", "--binary", "--no-color",
+                        "--no-ext-diff", "--no-textconv", sha])
+    mensagem = _git_bytes(["log", "-1", "--format=%B", sha])
+    if not patch or mensagem is None:
+        return None
+    linhas = [b"@@" if linha.startswith(b"@@ ") else linha
+              for linha in patch.split(b"\n")[1:]  # 1ª linha é o sha
+              if not linha.startswith(b"index ")]
+    if not any(linhas):
+        return None
+    impressao = hashlib.sha256(
+        b"\n".join(linhas) + b"\0" + mensagem).hexdigest()
+    saida = (_git_bytes(["patch-id", "--stable"], entrada=patch) or b"").split()
+    patch_id = saida[0].decode("ascii", "replace") if saida else ""
+    return impressao, patch_id
+
+
+def gravar_aprovacao_patch(sha: str, revisor: str,
+                           familia: str | None) -> None:
+    """Registra a impressão do commit aprovado (1 linha JSON, atômico).
+
+    Como no cache de árvore, não grava aprovação sem família conhecida ou
+    do próprio modelo (glm/muse): o revisor independente precisa ser
+    ouvido de novo. Falha aqui nunca derruba a aprovação por sha.
+    """
+    try:
+        familias = {f for f in (familia or "").split(",") if f}
+        if not familias or familias & (set(MESMO_MODELO) | {"desconhecido"}):
+            return
+        if not aprovacao_por_patch_ativa():
+            return
+        dados_patch = impressao_commit(sha)
+        if dados_patch is None:
+            return
+        impressao, patch_id = dados_patch
+        pasta = base_dir() / "aprovados-patch"
+        pasta.mkdir(parents=True, exist_ok=True)
+        dados = {"quando": agora_iso(), "sha": sha, "patch_id": patch_id,
+                 "revisor": revisor[:200],
+                 "familia": ",".join(sorted(familias))}
+        temporario = pasta / f"{impressao}.tmp"
+        temporario.write_text(json.dumps(dados, ensure_ascii=False) + "\n",
+                              encoding="utf-8")
+        os.replace(temporario, pasta / impressao)
+    except (OSError, RuntimeError) as exc:
+        log(f"aprovação por patch não gravada: {exc}")
+
+
+def aprovacao_herdavel(sha: str) -> dict | None:
+    """Aprovação de outro sha com o mesmo conteúdo deste commit, se houver.
+
+    Só vale enquanto o commit originalmente aprovado mantiver o marcador
+    incondicional (aprovação revogada ou expirada na faxina não é herdada).
+    """
+    dados_patch = impressao_commit(sha)
+    if dados_patch is None:
+        return None
+    impressao, patch_id = dados_patch
+    dados = _ler_json(base_dir() / "aprovados-patch" / impressao)
+    if dados is None:
+        return None
+    origem = dados.get("sha")
+    if (not isinstance(origem, str) or origem == sha
+            or not isinstance(dados.get("familia"), str)
+            or not dados["familia"] or not esta_aprovado(origem)):
+        return None
+    return {**dados, "impressao": impressao, "patch_id": patch_id}
+
+
+def prefixo_herdado(novos: list[str],
+                    topo: str | None = None) -> list[tuple[str, dict]]:
+    """Commits iniciais do lote pendente que herdam aprovação por conteúdo.
+
+    Para no primeiro commit sem aprovação herdável: daí em diante o lote
+    vai para a revisão normal (o diff do revisor é pai-do-primeiro..ponta).
+    """
+    herdados: list[tuple[str, dict]] = []
+    try:
+        if not aprovacao_por_patch_ativa(topo):
+            return herdados
+        for sha in novos:
+            dados = aprovacao_herdavel(sha)
+            if dados is None:
+                break
+            herdados.append((sha, dados))
+    except (OSError, RuntimeError) as exc:
+        log(f"aprovação por patch não consultada: {exc}")
+        return []
+    return herdados
+
+
+def registrar_herdados(herdados: list[tuple[str, dict]]) -> None:
+    """Marca os commits herdados como aprovados, com relatório e log."""
+    for sha, dados in herdados:
+        origem = dados["sha"]
+        resumo = (f"aprovação reaproveitada de {sha7(origem)} "
+                  f"(mesmo patch após rebase): {dados.get('revisor', '')}")
+        marcar_aprovado(sha, resumo, familia=dados["familia"],
+                        herdado_de=origem)
+        salvar_relatorio(sha, (
+            "APROVADO (aprovação reaproveitada, sem nova chamada à IA)\n\n"
+            f"- commit deste push: {sha}\n"
+            f"- commit aprovado antes: {origem}\n"
+            f"- aprovado em: {dados.get('quando', '?')}\n"
+            f"- revisor original: {dados.get('revisor', '?')} "
+            f"(família {dados['familia']})\n"
+            f"- patch-id (--stable): {dados['patch_id'] or '?'}\n"
+            f"- impressão do patch + mensagem (sha256): {dados['impressao']}\n"
+            "\nO conteúdo do commit é idêntico ao aprovado; gitleaks e "
+            "checks rodaram de novo na árvore deste push.\n"))
+        limpar_inconclusivo(sha)
+        log(f"aprovação reaproveitada: {sha} herda de {origem} "
+            f"(patch-id {dados['patch_id'] or '?'}, "
+            f"impressão {dados['impressao'][:16]})")
+        print(f"revisor: {sha7(sha)} reaproveita a aprovação de "
+              f"{sha7(origem)} (mesmo patch após rebase)")
 
 
 def salvar_relatorio(sha: str, texto: str) -> None:
@@ -4255,6 +4422,10 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
         return caminho_correcao_push(novos, local_sha,
                                      relatorio_para_retomada(local_sha),
                                      topo, remote, remote_ref, local_ref)
+    herdados = prefixo_herdado(novos, topo)
+    novos_ia = novos[len(herdados):]
+    contexto_ia = [*(ja_aprovados or []), *(s for s, _ in herdados)]
+
     def _bloquear_check(relatorio: str) -> int:
         """Falha de check: salva o relatório em cada novo e bloqueia o push."""
         for sha in novos:
@@ -4345,16 +4516,25 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
                 log(f"qa: não disparado: {exc}")
             return 0
     # gitleaks acima cobre o intervalo inteiro; a IA vê só os pendentes
-    veredito, saida, familias = revisar_diff(
-        base, local_sha, topo, resumo_commits(novos),
-        contexto=resumo_commits(ja_aprovados) if ja_aprovados else None,
-        risco_alto=caminhos_alto if risco == "alto" else None,
-        intencao=intencao_commits(novos, ponta=local_sha),
-        evidencia=evidencia_gate(local_sha))
+    if not novos_ia:
+        veredito, saida, familias = ("APROVADO",
+                                     "aprovação reaproveitada por patch",
+                                     set())
+    else:
+        veredito, saida, familias = revisar_diff(
+            pai1_ou_vazio(novos_ia[0]), local_sha, topo,
+            resumo_commits(novos_ia),
+            contexto=(resumo_commits(contexto_ia) if contexto_ia else None),
+            risco_alto=caminhos_alto if risco == "alto" else None,
+            intencao=intencao_commits(novos_ia, ponta=local_sha),
+            evidencia=evidencia_gate(local_sha))
+    familias_ia = set(familias)
+    familias = set(familias) | {
+        f for _, dados in herdados for f in dados["familia"].split(",") if f}
     if ia_primeiro and veredito != "APROVADO":
         log(f"check completo evitado: IA {veredito} antes do check")
     if veredito == "GRANDE_DEMAIS":
-        grupos = grupos_do_push(novos)
+        grupos = grupos_do_push(novos_ia)
         if grupos is not None:
             if ia_primeiro:
                 # um completo só, na ponta do push, como na ordem antiga
@@ -4370,7 +4550,7 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
                 ponta_grupo = grupo[-1]
                 risco_grupo, altos_grupo = classificar_risco(
                     base_grupo, ponta_grupo)
-                contexto_grupo = [*(ja_aprovados or []), *aprovados_antes]
+                contexto_grupo = [*contexto_ia, *aprovados_antes]
                 veredito_grupo, saida_grupo, familias_grupo = revisar_diff(
                     base_grupo, ponta_grupo, topo, resumo_commits(grupo),
                     contexto=(resumo_commits(contexto_grupo)
@@ -4417,6 +4597,7 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
                 print("push bloqueado. Para enviar sem revisão: "
                       "REVISOR_PULAR=1 git push")
                 return 1
+            registrar_herdados(herdados)
             print(f"revisor: push aprovado; {len(novos)} commit(s) revisados "
                   f"em {len(grupos)} grupo(s)")
             disparar_suite_fundo_se_preciso(novos, local_sha, topo, base)
@@ -4438,11 +4619,16 @@ def revisar_intervalo(novos: list[str], local_sha: str, topo: str,
                   "REVISOR_PULAR=1 git push")
             return 1
         resumo = primeira_linha(saida)
-        familia = ",".join(sorted(familias))
-        for sha in novos:
+        familia = ",".join(sorted(familias_ia))
+        for sha in novos_ia:
             marcar_aprovado(sha, resumo, familia=familia)
             limpar_inconclusivo(sha)  # ex.: revisão adiada pelo próprio push
-        print(f"revisor: push aprovado; {len(novos)} commit(s) revisados")
+        registrar_herdados(herdados)
+        if herdados:
+            print(f"revisor: push aprovado; {len(novos_ia)} commit(s) "
+                  f"revisados, {len(herdados)} com aprovação reaproveitada")
+        else:
+            print(f"revisor: push aprovado; {len(novos)} commit(s) revisados")
         disparar_suite_fundo_se_preciso(novos, local_sha, topo, base)
         try:
             disparar_qa(novos, local_sha, topo, base, remote, remote_ref)
@@ -7055,7 +7241,7 @@ def faxina_repo(topo: str) -> dict[str, int]:
             base = None
         if base is not None:
             for sub in ("relatorios", "aprovados", "checks-ok", "partes",
-                        "arvores", "deteccao"):
+                        "arvores", "deteccao", "aprovados-patch"):
                 try:
                     pasta = base / sub
                     if not pasta.is_dir():

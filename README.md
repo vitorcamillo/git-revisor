@@ -140,6 +140,8 @@ git config revisor.checkFinal selecionado
 git config revisor.autopush true
 ```
 
+`revisor.aprovacaoPorPatch` (padrão `true`): commit rebaseado sem mudança de conteúdo herda a aprovação do sha anterior (impressão do patch + mensagem, mais estrita que `git patch-id`); gitleaks e checks rodam de novo; conflito resolvido à mão muda a impressão e é revisado de novo; registro em `.git/revisor/relatorios/<sha>.md` e no log.
+
 ## Como funciona
 
 - Os hooks de commit e push chamam o revisor. No push, os commits ainda não aprovados são revisados antes do envio; uma reprovação bloqueia o push.
