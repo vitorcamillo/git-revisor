@@ -7017,6 +7017,26 @@ def _encerrar_qa_anterior(pid: int) -> bool:
     return not any(_processo_vivo(alvo) for alvo in alvos)
 
 
+def _pasta_estavel_qa(topo: str) -> str:
+    """Pasta de onde o QA em fundo roda: a árvore principal, senão `topo`.
+
+    O push pode sair de uma worktree temporária que é apagada logo
+    depois; o QA espera o deploy por minutos e morria sem relatório
+    ("Unable to read current working directory"). Ele só lê objetos do
+    git, então a árvore principal (que não some) serve.
+    """
+    try:
+        r = git(["worktree", "list", "--porcelain"], cwd=topo)
+    except (OSError, subprocess.SubprocessError):
+        return topo
+    linhas = r.stdout.splitlines() if r.returncode == 0 else []
+    if (linhas and linhas[0].startswith("worktree ")
+            and "bare" not in linhas[1:3]
+            and os.path.isdir(linhas[0][9:])):
+        return linhas[0][9:]
+    return topo
+
+
 def disparar_qa(novos: list[str], local_sha: str, topo: str, base: str,
                remote: str | None, remote_ref: str | None) -> None:
     """Dispara `qa <local_sha>` desacoplado após um push APROVADO, se ligado.
@@ -7099,7 +7119,7 @@ def disparar_qa(novos: list[str], local_sha: str, topo: str, base: str,
         proc = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "qa", local_sha],
             start_new_session=True, stdin=subprocess.DEVNULL,
-            stdout=saida, stderr=saida, cwd=topo,
+            stdout=saida, stderr=saida, cwd=_pasta_estavel_qa(topo),
             env={**os.environ, TOKEN_QA_FUNDO_ENV: token,
                  "REVISOR_QA_RODADA": str(rodada)})
     except OSError as exc:

@@ -1103,3 +1103,26 @@ def test_status_mostra_sem_alvo(
     saida = capsys.readouterr().out
     assert "QA cliente" in saida
     assert "qa: sem alvo" in saida
+
+
+# ---------------- QA sobrevive à worktree temporária apagada
+
+def test_qa_roda_na_arvore_principal_quando_push_sai_de_worktree(
+        repo: Path, tmp_path: Path) -> None:
+    """Push de worktree temporária: o QA em fundo roda na árvore principal."""
+    _liga_qa(repo)
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt))
+    assert mod._pasta_estavel_qa(str(wt)) == str(repo)
+    assert mod._pasta_estavel_qa(str(repo)) == str(repo)
+
+
+def test_pasta_estavel_em_repositorio_bare_fica_no_topo(
+        repo: Path, tmp_path: Path) -> None:
+    """Sem árvore principal (bare), mantém a pasta de onde o push saiu."""
+    _liga_qa(repo)
+    bare = tmp_path / "bare.git"
+    _git(repo, "clone", "-q", "--bare", str(repo), str(bare))
+    wt = tmp_path / "wt-bare"
+    _git(bare, "worktree", "add", "-q", "--detach", str(wt))
+    assert mod._pasta_estavel_qa(str(wt)) == str(wt)
