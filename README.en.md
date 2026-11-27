@@ -165,6 +165,7 @@ Optional: a versioned `.revisor/qa-armadilhas.md` lists known false positives; t
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `REVISOR_CMD_QA` | `codex-ask --mode qa` | Agent that uses the product as a client. |
+| `REVISOR_CMD_QA2` | `claude-ask --mode qa` | Fallback agent when the main one is out of quota (exit 75). |
 | `REVISOR_CMD_QA_VERIFICAR` | `claude-ask --mode qa` | Independent verifier of the proofs. |
 | `REVISOR_QA_TIMEOUT` | `1500` | Timeout in seconds for each QA call. |
 | `REVISOR_QA_ESPERA` | `1200` | Ceiling in seconds for waiting on the remote and on `revisor.qaPronto`. |

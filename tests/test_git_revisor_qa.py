@@ -566,3 +566,17 @@ def test_correcao_positiva_agenda_revalidacao_sem_matar_supervisor(
     assert dados["rodada"] == 1
     assert dados["pid"] == 424242
     assert "qa cliente disparado" in _log()
+
+
+def test_sem_cota_usa_agente_reserva(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        sem_espera: None) -> None:
+    """Exit 75 no agente principal cai no reserva (REVISOR_CMD_QA2)."""
+    sha = _liga_qa(repo)
+    monkeypatch.setenv("REVISOR_CMD_QA", _stub(tmp_path / "q1.sh", "exit 75\n"))
+    monkeypatch.setenv("REVISOR_CMD_QA2", _stub(
+        tmp_path / "q2.sh", 'printf "%s\\n" "ACEITE: 1/1" "QA: APROVADO"\n'))
+    assert mod.cmd_qa(sha) == 0
+    relatorio = (repo / ".git" / "revisor" / "qa" / f"{sha}.md").read_text(
+        encoding="utf-8")
+    assert "QA: APROVADO" in relatorio

@@ -167,6 +167,7 @@ Opcional: `.revisor/qa-armadilhas.md` versionado lista falsos positivos conhecid
 | Variável | Padrão | Efeito |
 | --- | --- | --- |
 | `REVISOR_CMD_QA` | `codex-ask --mode qa` | Agente que usa o produto como cliente. |
+| `REVISOR_CMD_QA2` | `claude-ask --mode qa` | Agente reserva quando o principal está sem cota (saída 75). |
 | `REVISOR_CMD_QA_VERIFICAR` | `claude-ask --mode qa` | Verificador independente das provas. |
 | `REVISOR_QA_TIMEOUT` | `1500` | Timeout em segundos de cada chamada do QA. |
 | `REVISOR_QA_ESPERA` | `1200` | Teto em segundos da espera pelo remoto e pelo `revisor.qaPronto`. |

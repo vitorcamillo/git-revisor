@@ -7021,6 +7021,13 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
     cmd = comando("REVISOR_CMD_QA", "codex-ask --mode qa")
     codigo, saida = chamar_comando(cmd, tmp, [prompt], qa_timeout_s())
     if codigo == 75:
+        # Sem cota no agente principal: tenta o reserva antes de desistir.
+        cmd2 = comando("REVISOR_CMD_QA2", "claude-ask --mode qa")
+        if cmd2 and cmd2 != cmd:
+            log("qa: agente principal sem cota; tentando o reserva")
+            codigo, saida = chamar_comando(cmd2, tmp, [prompt],
+                                           qa_timeout_s())
+    if codigo == 75:
         shutil.rmtree(tmp, ignore_errors=True)
         return _qa_sem_veredito(sha, "INDISPONIVEL",
                                 "QA sem cota (exit 75)", aceite)
@@ -7041,9 +7048,15 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
     confirmados: list[bool] = [False] * len(achados)
     if achados:
         cmd_ver = comando("REVISOR_CMD_QA_VERIFICAR", "claude-ask --mode qa")
-        codigo_ver, saida_ver = chamar_comando(
-            cmd_ver, tmp, [montar_prompt_verificacao(achados)],
-            qa_timeout_s())
+        # Verificador em diretório vazio próprio: não herda os scripts do
+        # QA (independência) e o wrapper do modo qa exige cwd vazio.
+        tmp_ver = tempfile.mkdtemp(prefix="revisor-qa-ver-")
+        try:
+            codigo_ver, saida_ver = chamar_comando(
+                cmd_ver, tmp_ver, [montar_prompt_verificacao(achados)],
+                qa_timeout_s())
+        finally:
+            shutil.rmtree(tmp_ver, ignore_errors=True)
         shutil.rmtree(tmp, ignore_errors=True)
         if codigo_ver != 0:
             relatorio = _gravar_relatorio_qa(
