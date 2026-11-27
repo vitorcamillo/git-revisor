@@ -516,7 +516,7 @@ def _mock_fluxo_arvore(monkeypatch: pytest.MonkeyPatch,
                        recebidas: list[str | None]) -> None:
     """Mocks comuns do fluxo de correção capturando a árvore repassada."""
 
-    def falso(texto, topo, commits, **kw):
+    def falso(texto, topo, commits, *a, **kw):
         recebidas.append(kw.get("arvore"))
         return "APROVADO", "ok", {"codex"}
 
