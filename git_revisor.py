@@ -5262,7 +5262,8 @@ def fluxo_correcao(sha_original: str, relatorio: str, topo: str,
             intencao=intencao_commits([anterior], ponta=anterior,
                                       aceite_de=[*lote, anterior]),
             evidencia=evidencia_gate(anterior),
-            delta_correcao=diff_entre(sha_original, anterior))
+            delta_correcao=diff_entre(sha_original, anterior),
+            arvore=arvore_de(anterior))
         if veredito_ant != "APROVADO" and ia_primeiro:
             log(f"check completo evitado: IA {veredito_ant} antes do check")
         if veredito_ant == "APROVADO":
@@ -5330,7 +5331,8 @@ def fluxo_correcao(sha_original: str, relatorio: str, topo: str,
             intencao=intencao_commits([novo], ponta=novo,
                                       aceite_de=[*lote, novo]),
             evidencia=evidencia_gate(novo),
-            delta_correcao=delta)
+            delta_correcao=delta,
+            arvore=arvore_de(novo))
         if veredito != "APROVADO" and ia_primeiro:
             log(f"check completo evitado: IA {veredito} antes do check")
         if veredito == "APROVADO":

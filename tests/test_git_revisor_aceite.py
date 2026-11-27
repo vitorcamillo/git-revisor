@@ -512,6 +512,57 @@ def test_revisar_diff_repassa_arvore_da_ponta(
     assert recebidas == [mod.arvore_de(ponta)]
 
 
+def _mock_fluxo_arvore(monkeypatch: pytest.MonkeyPatch,
+                       recebidas: list[str | None]) -> None:
+    """Mocks comuns do fluxo de correção capturando a árvore repassada."""
+
+    def falso(texto, topo, commits, **kw):
+        recebidas.append(kw.get("arvore"))
+        return "APROVADO", "ok", {"codex"}
+
+    monkeypatch.setattr(mod, "revisar_por_partes", falso)
+    monkeypatch.setattr(mod, "log", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "notificar", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "classificar_risco",
+                        lambda *a, **k: ("baixo", []))
+    monkeypatch.setattr(mod, "ordem_revisao", lambda *a, **k: "check-primeiro")
+    monkeypatch.setattr(mod, "esta_aprovado", lambda *a, **k: False)
+    monkeypatch.setattr(mod, "rodar_checks", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(mod, "rodar_checks_rapidos",
+                        lambda *a, **k: (True, ""))
+    monkeypatch.setattr(mod, "autorrevisao", lambda *a, **k: False)
+    monkeypatch.setattr(mod, "aprovar_correcao", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "integrar_correcao", lambda *a, **k: 0)
+
+
+def test_fluxo_correcao_retomada_repassa_arvore_do_anterior(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retomada em fluxo_correcao: conferência usa a árvore de `anterior`."""
+    recebidas: list[str | None] = []
+    _mock_fluxo_arvore(monkeypatch, recebidas)
+    sha = _commit(repo, {"a.txt": "1\n"}, "feat: base")
+    anterior = _commit(repo, {"a.txt": "2\n"}, "fix: correcao guardada")
+    monkeypatch.setattr(mod, "retomar_tentativa",
+                        lambda *a, **k: anterior)
+    assert mod.fluxo_correcao(sha, "relatorio", str(repo)) == 0
+    assert recebidas == [mod.arvore_de(anterior)]
+
+
+def test_fluxo_correcao_nova_tentativa_repassa_arvore_do_novo(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nova correção em fluxo_correcao: conferência usa a árvore de `novo`."""
+    recebidas: list[str | None] = []
+    _mock_fluxo_arvore(monkeypatch, recebidas)
+    sha = _commit(repo, {"a.txt": "1\n"}, "feat: base")
+    novo = _commit(repo, {"a.txt": "2\n"}, "fix: correcao nova")
+    monkeypatch.setattr(mod, "retomar_tentativa", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "rodadas_max", lambda: 1)
+    monkeypatch.setattr(mod, "tentativa_correcao",
+                        lambda *a, **k: (novo, "codex"))
+    assert mod.fluxo_correcao(sha, "relatorio", str(repo)) == 0
+    assert recebidas == [mod.arvore_de(novo)]
+
+
 # ------------------------------------------- conferência final de aceite
 
 _RODAPE_CODEX = "--- codex-ask: modo=review gpt ---"
