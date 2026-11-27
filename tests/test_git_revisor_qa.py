@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -374,3 +375,190 @@ def test_no_limite_de_rodadas_nao_corrige(
     relatorio = (_base_dir() / "qa" / f"{sha}.md").read_text(
         encoding="utf-8")
     assert "QA: REPROVADO" in relatorio
+
+
+# ------------------------- critério 1 (subcomando qa com QA desligado)
+
+def test_cmd_qa_desligado_sem_config_pula_sem_chamar_stub(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        sem_espera: None) -> None:
+    """Subcomando `qa` sem `revisor.qa`: PULADO sem chamar o comando."""
+    sha = _commit(repo, {".revisor/qa.md": "# Roteiro\n"}, "feat: x")
+    marcador = tmp_path / "qa-chamado"
+    qa = _stub(tmp_path / "qa.sh",
+               f'touch "{marcador}"\nprintf "%s\\n" "QA: APROVADO"\n')
+    monkeypatch.setenv("REVISOR_CMD_QA", qa)
+    assert mod.cmd_qa(sha) == 0
+    assert not marcador.exists()
+    relatorio = (_base_dir() / "qa" / f"{sha}.md").read_text(
+        encoding="utf-8")
+    assert "QA: PULADO" in relatorio
+
+
+def test_cmd_qa_desligado_por_env_pula_sem_chamar_stub(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        sem_espera: None) -> None:
+    """Subcomando `qa` com `REVISOR_QA=0`: PULADO sem chamar o comando."""
+    sha = _liga_qa(repo)
+    marcador = tmp_path / "qa-chamado"
+    qa = _stub(tmp_path / "qa.sh",
+               f'touch "{marcador}"\nprintf "%s\\n" "QA: APROVADO"\n')
+    monkeypatch.setenv("REVISOR_CMD_QA", qa)
+    monkeypatch.setenv("REVISOR_QA", "0")
+    assert mod.cmd_qa(sha) == 0
+    assert not marcador.exists()
+    relatorio = (_base_dir() / "qa" / f"{sha}.md").read_text(
+        encoding="utf-8")
+    assert "QA: PULADO" in relatorio
+
+
+# --------------------------- critério 2 (push previamente aprovado)
+
+def test_push_previamente_aprovado_agenda_qa(
+        repo: Path, sem_espera: None) -> None:
+    """Push sem pendências (tudo aprovado) agenda o QA e devolve 0."""
+    base = _liga_qa(repo)
+    sha = _commit(repo, {"app.py": "print(1)\n"}, "feat: app")
+    mod.marcar_aprovado(base, "teste")
+    mod.marcar_aprovado(sha, "teste")
+    refs = [(sha, base, "refs/heads/main", "refs/heads/main")]
+    assert mod.revisar_refs(refs, "origin") == 0
+    assert "qa cliente disparado" in _log()
+
+
+# ---------------- critério 4 (substituição encerra os descendentes)
+
+def test_disparo_substitui_execucao_em_outra_sessao(
+        repo: Path, tmp_path: Path, sem_espera: None) -> None:
+    """Sha novo encerra supervisor anterior e descendentes dele."""
+    base = _liga_qa(repo)
+    antigo = _commit(repo, {"app.py": "print(1)\n"}, "feat: antigo")
+    novo = _commit(repo, {"app.py": "print(2)\n"}, "feat: novo")
+    arq_filho = tmp_path / "filho.pid"
+    vitima = subprocess.Popen(
+        ["sh", "-c",
+         f'sleep 30 & echo $! > "{arq_filho}"; wait'],
+        start_new_session=True, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        filho: int | None = None
+        for _ in range(100):
+            if arq_filho.exists():
+                texto = arq_filho.read_text(encoding="utf-8").strip()
+                if texto:
+                    filho = int(texto)
+                    break
+            time.sleep(0.05)
+        assert filho is not None
+        fundo = _base_dir() / "qa-fundo.json"
+        fundo.parent.mkdir(parents=True, exist_ok=True)
+        fundo.write_text(json.dumps(
+            {"sha": antigo, "novos": [antigo], "base": base,
+             "remote": "origin", "remote_ref": "refs/heads/main",
+             "rodada": 0, "token": "t", "pid": vitima.pid}) + "\n",
+            encoding="utf-8")
+        mod.disparar_qa([novo], novo, str(repo), base, "origin",
+                        "refs/heads/main")
+        assert not mod._processo_vivo(vitima.pid)
+        assert not mod._processo_vivo(filho)
+        assert "qa cliente disparado" in _log()
+    finally:
+        try:
+            vitima.kill()
+        except OSError:
+            pass
+        try:
+            vitima.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+# --------------------------------- critério 5 (prazo da espera)
+
+def test_espera_zero_nao_aceita_pronto_que_so_libera_depois(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Com espera 0, `qaPronto` pronto não libera: o prazo vale já."""
+    sha = _liga_qa(repo)
+    _git(repo, "config", "revisor.qaPronto", "exit 0")
+    monkeypatch.setenv("REVISOR_QA_ESPERA", "0")
+    ok, motivo = mod._esperar_qa_liberar(sha, str(repo), None, None)
+    assert ok is False
+    assert "após 0s" in motivo
+
+
+def test_pronto_com_limite_zero_nao_roda_comando(
+        repo: Path, tmp_path: Path) -> None:
+    """`_qa_pronto_ok` com limite 0 nem executa o comando de prontidão."""
+    sha = _liga_qa(repo)
+    marcador = tmp_path / "pronto-chamado"
+    _git(repo, "config", "revisor.qaPronto", f'touch "{marcador}"')
+    assert mod._qa_pronto_ok(sha, str(repo), limite=0) is False
+    assert not marcador.exists()
+    assert mod._remoto_contem("origin", "refs/heads/main", sha,
+                              str(repo), limite=0) is False
+
+
+def test_espera_zero_sem_remoto_nem_pronto_libera(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sem remoto nem `qaPronto`, espera 0 libera (nada a esperar)."""
+    sha = _liga_qa(repo)
+    monkeypatch.setenv("REVISOR_QA_ESPERA", "0")
+    ok, _motivo = mod._esperar_qa_liberar(sha, str(repo), None, None)
+    assert ok is True
+
+
+# ------------- critério 11 (cadeia positiva da correção automática)
+
+def test_correcao_positiva_agenda_revalidacao_sem_matar_supervisor(
+        repo: Path, monkeypatch: pytest.MonkeyPatch,
+        sem_espera: None) -> None:
+    """Correção agenda revalidação (rodada+1) sem encerrar quem agenda."""
+    sha = _liga_qa(repo)
+    _git(repo, "config", "revisor.qaCorrigir", "true")
+    branch = _git(repo, "branch", "--show-current").stdout.strip()
+    _git(repo, "config", f"branch.{branch}.remote", "origin")
+    _git(repo, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+    monkeypatch.setenv("REVISOR_QA_RODADA", "0")
+    fundo = _base_dir() / "qa-fundo.json"
+    fundo.parent.mkdir(parents=True, exist_ok=True)
+    fundo.write_text(json.dumps(
+        {"sha": sha, "novos": [sha], "rodada": 0, "token": "sup",
+         "pid": os.getpid()}) + "\n", encoding="utf-8")
+    encerramentos: list[int] = []
+    monkeypatch.setattr(
+        mod, "_encerrar_qa_anterior",
+        lambda pid: encerramentos.append(pid) or True)
+    novo: dict[str, str] = {}
+
+    def fluxo_falso(original: str, relatorio: str, topo: str,
+                    lote: list[str] | None = None) -> int:
+        novo["sha"] = _commit(repo, {"app.py": "print('ok')\n"},
+                              "fix: correcao do QA")
+        return 0
+
+    monkeypatch.setattr(mod, "fluxo_correcao", fluxo_falso)
+    pushes: list[str] = []
+    monkeypatch.setattr(mod, "autopush",
+                        lambda s, t: pushes.append(s))
+    comandos: list[tuple] = []
+
+    class _ProcFalso:
+        pid = 424242
+
+    def popen_falso(cmd: list[str], **kwargs) -> _ProcFalso:
+        comandos.append((cmd, kwargs))
+        return _ProcFalso()
+
+    monkeypatch.setattr(mod.subprocess, "Popen", popen_falso)
+    mod._qa_corrigir(sha, str(repo), "relatorio do QA", 0)
+    assert pushes == [novo["sha"]]
+    assert os.getpid() not in encerramentos
+    assert len(comandos) == 1
+    cmd, kwargs = comandos[0]
+    assert cmd[-2:] == ["qa", novo["sha"]]
+    assert kwargs["env"]["REVISOR_QA_RODADA"] == "1"
+    dados = json.loads(fundo.read_text(encoding="utf-8"))
+    assert dados["sha"] == novo["sha"]
+    assert dados["rodada"] == 1
+    assert dados["pid"] == 424242
+    assert "qa cliente disparado" in _log()

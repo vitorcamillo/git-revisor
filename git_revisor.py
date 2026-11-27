@@ -6500,6 +6500,23 @@ def _processo_vivo(pid: int) -> bool:
     return True
 
 
+def _processo_atual_e_ou_descende_de(pid: int) -> bool:
+    """True se `pid` é este processo ou um ancestral dele (via /proc)."""
+    atual = os.getpid()
+    vistos: set[int] = set()
+    while atual > 0 and atual not in vistos:
+        if atual == pid:
+            return True
+        vistos.add(atual)
+        try:
+            texto = Path(f"/proc/{atual}/stat").read_text(
+                encoding="utf-8", errors="replace")
+            atual = int(texto.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
 def _encerrar_qa_anterior(pid: int) -> bool:
     """Encerra o supervisor e todos os descendentes; True se todos saíram.
 
@@ -6579,7 +6596,14 @@ def disparar_qa(novos: list[str], local_sha: str, topo: str, base: str,
             else:
                 if dados_ant.get("sha") == local_sha:
                     return  # mesma árvore já rodando
-                if not _encerrar_qa_anterior(pid_ant):
+                # Quem agenda pode ser o próprio supervisor (revalidação
+                # da correção) ou um descendente dele (push interno do
+                # autopush): encerrar o anterior mataria quem agenda e o
+                # push em andamento. Nesse caso o anterior já está
+                # saindo — substituir o registro sem sinalizá-lo e
+                # disparar a nova execução, que roda desacoplada.
+                if (not _processo_atual_e_ou_descende_de(pid_ant)
+                        and not _encerrar_qa_anterior(pid_ant)):
                     log("qa: execução anterior não encerrou; "
                         "novo disparo pulado")
                     return
@@ -6670,8 +6694,9 @@ def _esperar_qa_liberar(sha: str, topo: str, remote: str | None,
     intervalo = qa_intervalo_s()
     if espera <= 0:
         presente = ((not remote or not remote_ref)
-                    or _remoto_contem(remote, remote_ref, sha, topo))
-        pronto = _qa_pronto_ok(sha, topo)
+                    or _remoto_contem(remote, remote_ref, sha, topo,
+                                      limite=espera))
+        pronto = _qa_pronto_ok(sha, topo, limite=espera)
         if presente and pronto:
             return True, ""
         if not presente:
