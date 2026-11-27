@@ -4507,6 +4507,18 @@ def algum_pendente(refs: list[tuple], remote: str) -> bool:
                for local, remota, *_resto in refs)
 
 
+def _disparar_qa_aprovados(completos: list[str], local_sha: str, topo: str,
+                           remote: str, remote_ref: str | None) -> None:
+    """Agenda o QA de uma ref já aprovada (push sem pendências nela)."""
+    if not completos:
+        return
+    try:
+        disparar_qa(list(completos), local_sha, topo,
+                    pai1_ou_vazio(completos[0]), remote, remote_ref)
+    except Exception as exc:
+        log(f"qa: não disparado: {exc}")
+
+
 def revisar_refs(refs: list[tuple], remote: str) -> int:
     """Revisa os commits pendentes de cada ref; 0 libera o push, 1 bloqueia."""
     topo = toplevel()
@@ -4517,8 +4529,12 @@ def revisar_refs(refs: list[tuple], remote: str) -> int:
         completos = commits_novos(local_sha, remote_sha, remote)
         novos = pendentes(completos, local_sha)
         ja_aprovados = [s for s in completos if s not in novos]
-        if novos and revisar_intervalo(novos, local_sha, topo, ja_aprovados,
-                                       remote, remote_ref, local_ref) != 0:
+        if not novos:
+            _disparar_qa_aprovados(completos, local_sha, topo, remote,
+                                   remote_ref)
+            continue
+        if revisar_intervalo(novos, local_sha, topo, ja_aprovados,
+                             remote, remote_ref, local_ref) != 0:
             return 1
     return 0
 
@@ -4531,7 +4547,22 @@ def hook_pre_push(remote: str, _url: str, entrada: str) -> int:
         log("pre-push PULADO PELO USUARIO (REVISOR_PULAR=1)")
         return 0
     refs = refs_do_push_completo(entrada)
-    if not refs or not algum_pendente(refs, remote):
+    if not refs:
+        return 0
+    if not algum_pendente(refs, remote):
+        # tudo já aprovado: sem revisão, mas o QA do push ainda é agendado
+        try:
+            topo = toplevel()
+        except RuntimeError:
+            return 0
+        for local_sha, remote_sha, remote_ref, _local_ref in refs:
+            try:
+                completos = commits_novos(local_sha, remote_sha, remote)
+            except RuntimeError as exc:
+                log(f"qa: não disparado: {exc}")
+                continue
+            _disparar_qa_aprovados(completos, local_sha, topo, remote,
+                                   remote_ref)
         return 0
     # a partir daqui há pendente: o aviso dá a este push prioridade na fila
     aviso = marcar_push_esperando()
@@ -6425,6 +6456,90 @@ def _apagar_qa_fundo_se_minha(pid: int | None,
             pass
 
 
+def _descendentes(pid: int) -> list[int]:
+    """Descendentes de `pid` via /proc, dos mais profundos aos mais rasos."""
+    filhos: dict[int, list[int]] = {}
+    try:
+        entradas = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    for entrada in entradas:
+        if not entrada.name.isdigit():
+            continue
+        try:
+            texto = (entrada / "stat").read_text(
+                encoding="utf-8", errors="replace")
+            ppid = int(texto.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        filhos.setdefault(ppid, []).append(int(entrada.name))
+    ordem: list[int] = []
+    fila = list(filhos.get(pid, []))
+    while fila:
+        atual = fila.pop(0)
+        ordem.append(atual)
+        fila.extend(filhos.get(atual, []))
+    ordem.reverse()
+    return ordem
+
+
+def _processo_vivo(pid: int) -> bool:
+    """True se `pid` existe e não é zumbi."""
+    try:
+        texto = Path(f"/proc/{pid}/stat").read_text(
+            encoding="utf-8", errors="replace")
+        return texto.rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+    return True
+
+
+def _encerrar_qa_anterior(pid: int) -> bool:
+    """Encerra o supervisor e todos os descendentes; True se todos saíram.
+
+    O agente roda em sessão própria (ver `chamar_comando`), fora do grupo
+    do supervisor: matar só o grupo deixaria o agente vivo junto com a
+    execução do sha novo.
+    """
+    alvos = [*_descendentes(pid), pid]
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        pass
+    for alvo in alvos:
+        try:
+            os.kill(alvo, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+    limite = time.monotonic() + 5
+    while (time.monotonic() < limite
+           and any(_processo_vivo(alvo) for alvo in alvos)):
+        time.sleep(0.05)
+    vivos = [alvo for alvo in alvos if _processo_vivo(alvo)]
+    if not vivos:
+        return True
+    for alvo in vivos:
+        try:
+            os.kill(alvo, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    limite = time.monotonic() + 2
+    while (time.monotonic() < limite
+           and any(_processo_vivo(alvo) for alvo in alvos)):
+        time.sleep(0.05)
+    return not any(_processo_vivo(alvo) for alvo in alvos)
+
+
 def disparar_qa(novos: list[str], local_sha: str, topo: str, base: str,
                remote: str | None, remote_ref: str | None) -> None:
     """Dispara `qa <local_sha>` desacoplado após um push APROVADO, se ligado.
@@ -6464,10 +6579,10 @@ def disparar_qa(novos: list[str], local_sha: str, topo: str, base: str,
             else:
                 if dados_ant.get("sha") == local_sha:
                     return  # mesma árvore já rodando
-                try:
-                    os.killpg(pid_ant, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass
+                if not _encerrar_qa_anterior(pid_ant):
+                    log("qa: execução anterior não encerrou; "
+                        "novo disparo pulado")
+                    return
     rodada = qa_rodada_atual()
     token = os.urandom(8).hex()
     dados = {"sha": local_sha, "novos": novos, "base": base,
@@ -6512,10 +6627,13 @@ def disparar_qa(novos: list[str], local_sha: str, topo: str, base: str,
 
 
 def _remoto_contem(remote: str, remote_ref: str, sha: str,
-                   topo: str) -> bool:
+                   topo: str, limite: float | None = None) -> bool:
     """True se o remoto anuncia `sha` na ref (falha de rede = False)."""
+    timeout = 60.0 if limite is None else limite
+    if timeout <= 0:
+        return False
     try:
-        p = git(["ls-remote", remote, remote_ref], cwd=topo, timeout=60)
+        p = git(["ls-remote", remote, remote_ref], cwd=topo, timeout=timeout)
     except (subprocess.SubprocessError, OSError):
         return False
     if p.returncode != 0:
@@ -6524,14 +6642,18 @@ def _remoto_contem(remote: str, remote_ref: str, sha: str,
                for linha in p.stdout.splitlines() if linha.split())
 
 
-def _qa_pronto_ok(sha: str, topo: str) -> bool:
+def _qa_pronto_ok(sha: str, topo: str,
+                  limite: float | None = None) -> bool:
     """Roda `revisor.qaPronto` (via sh -c) com REVISOR_QA_SHA; exit 0 libera."""
     pronto = cfg("qaPronto", "")
     if not pronto:
         return True
+    timeout = 120.0 if limite is None else limite
+    if timeout <= 0:
+        return False
     try:
         p = subprocess.run(["sh", "-c", pronto], cwd=topo, check=False,
-                           capture_output=True, text=True, timeout=120,
+                           capture_output=True, text=True, timeout=timeout,
                            env={**env_limpo(), "REVISOR_QA_SHA": sha})
     except (subprocess.SubprocessError, OSError):
         return False
@@ -6546,20 +6668,41 @@ def _esperar_qa_liberar(sha: str, topo: str, remote: str | None,
     """
     espera = qa_espera_s()
     intervalo = qa_intervalo_s()
-    fim = time.monotonic() + espera
-    while True:
+    if espera <= 0:
         presente = ((not remote or not remote_ref)
                     or _remoto_contem(remote, remote_ref, sha, topo))
         pronto = _qa_pronto_ok(sha, topo)
         if presente and pronto:
             return True, ""
-        if time.monotonic() >= fim:
-            if not presente:
-                return False, (f"remoto sem {sha7(sha)} após "
-                               f"{espera:g}s de espera")
-            return False, f"qaPronto não liberou após {espera:g}s de espera"
+        if not presente:
+            return False, (f"remoto sem {sha7(sha)} após "
+                           f"{espera:g}s de espera")
+        return False, f"qaPronto não liberou após {espera:g}s de espera"
+    fim = time.monotonic() + espera
+    presente = False
+    while True:
         restante = fim - time.monotonic()
-        time.sleep(min(intervalo, max(0.0, restante)))
+        if restante <= 0:
+            break
+        presente = ((not remote or not remote_ref)
+                    or _remoto_contem(remote, remote_ref, sha, topo,
+                                      limite=restante))
+        restante = fim - time.monotonic()
+        if restante <= 0:
+            break
+        pronto = _qa_pronto_ok(sha, topo, limite=restante)
+        if presente and pronto:
+            if time.monotonic() >= fim:
+                break  # prontidão só depois do teto não libera
+            return True, ""
+        restante = fim - time.monotonic()
+        if restante <= 0:
+            break
+        time.sleep(min(intervalo, restante))
+    if not presente:
+        return False, (f"remoto sem {sha7(sha)} após "
+                       f"{espera:g}s de espera")
+    return False, f"qaPronto não liberou após {espera:g}s de espera"
 
 
 def _gravar_relatorio_qa(sha: str, veredito: str, motivo: str,
@@ -6630,6 +6773,9 @@ def cmd_qa(sha_curto: str) -> int:
         except (ValueError, TypeError):
             rodada = 0
     try:
+        if not qa_ligado(sha):
+            return _qa_sem_veredito(
+                sha, "PULADO", "QA desligado (revisor.qa/REVISOR_QA)")
         return _cmd_qa_exec(sha, topo, remote, remote_ref, novos, rodada)
     except Exception as exc:  # QA nunca derruba nem bloqueia nada
         log(f"qa: erro interno: {exc}")
@@ -6644,6 +6790,9 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
                  remote_ref: str | None, novos: list[str],
                  rodada: int) -> int:
     """Corpo do `cmd_qa` (separado para o finally limpar o registro)."""
+    if not qa_ligado(sha):
+        return _qa_sem_veredito(
+            sha, "PULADO", "QA desligado (revisor.qa/REVISOR_QA)")
     ok, motivo = _esperar_qa_liberar(sha, topo, remote, remote_ref)
     if not ok:
         return _qa_sem_veredito(sha, "PULADO", motivo)
@@ -6730,6 +6879,20 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
     return 0
 
 
+def _remoto_do_upstream(topo: str) -> tuple[str | None, str | None]:
+    """(remote, remote_ref) do upstream da branch atual; (None, None) sem ele."""
+    branch = git(["symbolic-ref", "-q", "HEAD"], cwd=topo).stdout.strip()
+    if not branch.startswith("refs/heads/"):
+        return None, None
+    nome = branch[len("refs/heads/"):]
+    remote = git(["config", f"branch.{nome}.remote"],
+                 cwd=topo).stdout.strip()
+    merge = git(["config", f"branch.{nome}.merge"], cwd=topo).stdout.strip()
+    if not remote or not merge.startswith("refs/heads/"):
+        return None, None
+    return remote, merge
+
+
 def _qa_corrigir(sha: str, topo: str, relatorio: str, rodada: int) -> None:
     """Correção automática do QA (opt-in): reusa fluxo + envio existentes.
 
@@ -6753,6 +6916,14 @@ def _qa_corrigir(sha: str, topo: str, relatorio: str, rodada: int) -> None:
     if depois != antes:
         log(f"qa: correção de {sha7(sha)} aplicada; enviando")
         autopush(depois, topo)
+        # a correção já nasce aprovada (fluxo_correcao): o push dela pode
+        # sair sem pendências e sem novo QA — agenda a revalidação aqui,
+        # com a rodada já incrementada no ambiente
+        try:
+            remote, remote_ref = _remoto_do_upstream(topo)
+            disparar_qa([depois], depois, topo, antes, remote, remote_ref)
+        except Exception as exc:
+            log(f"qa: revalidação não agendada: {exc}")
 
 
 def linhas_qa() -> list[str]:
