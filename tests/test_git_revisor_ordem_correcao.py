@@ -9,7 +9,7 @@ import importlib.util
 import json
 from pathlib import Path
 
-_spec = importlib.util.spec_from_file_location("git_revisor", Path(__file__).with_name("git_revisor.py"))
+_spec = importlib.util.spec_from_file_location("git_revisor", Path(__file__).parent.parent / "git_revisor.py")
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 

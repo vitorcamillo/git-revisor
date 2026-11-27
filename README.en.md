@@ -2,15 +2,15 @@
 
 [Português](README.md) · **English**
 
-![MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-green) ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white) ![Git](https://img.shields.io/badge/Git-hooks-F05032?logo=git&logoColor=white)
+![MIT](https://img.shields.io/badge/license-MIT-green) ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white) ![Git](https://img.shields.io/badge/Git-hooks-F05032?logo=git&logoColor=white)
 
 `git-revisor` adds automated AI review of commits to Git hooks. It serves developers who want to block defective pushes before sending, and it combines deterministic checks with diff review and isolated worktree fixes.
 
-![Demonstração do git-revisor](docs/demo.png)
+![git-revisor demo](docs/demo.png)
 
 *git-revisor blocking a push: the tests fail and the commit stays rejected until fixed.*
 
-## Summary
+## Contents
 
 - [Features](#features)
 - [Quick start](#quick-start)

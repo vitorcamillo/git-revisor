@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-_ARQUIVO = Path(__file__).with_name("git_revisor.py")
+_ARQUIVO = Path(__file__).parent.parent / "git_revisor.py"
 _spec = importlib.util.spec_from_file_location("git_revisor", _ARQUIVO)
 assert _spec is not None and _spec.loader is not None
 mod = importlib.util.module_from_spec(_spec)
