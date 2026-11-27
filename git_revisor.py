@@ -3435,10 +3435,58 @@ def ordem_revisao(topo: str | None = None) -> str:
     return "ia-primeiro"
 
 
+_ESCAPES_GIT = {"a": "\a", "b": "\b", "f": "\f", "n": "\n",
+                "r": "\r", "t": "\t", "v": "\v", "\\": "\\", '"': '"'}
+
+
+def _decodificar_caminho_git(token: str) -> str:
+    """Decodifica o quoting C do Git (`"p\\303\\241gina.txt"` → caminho)."""
+    if len(token) < 2 or token[0] != '"' or token[-1] != '"':
+        return token
+    bruto = bytearray()
+    interno = token[1:-1]
+    i = 0
+    while i < len(interno):
+        char = interno[i]
+        if char != "\\" or i + 1 >= len(interno):
+            bruto.extend(char.encode("utf-8"))
+            i += 1
+            continue
+        seguinte = interno[i + 1]
+        if seguinte in "01234567":
+            fim = i + 1
+            while fim < len(interno) and fim < i + 4 \
+                    and interno[fim] in "01234567":
+                fim += 1
+            bruto.append(int(interno[i + 1:fim], 8))
+            i = fim
+        elif seguinte in _ESCAPES_GIT:
+            bruto.extend(_ESCAPES_GIT[seguinte].encode("utf-8"))
+            i += 2
+        else:
+            bruto.extend(seguinte.encode("utf-8"))
+            i += 2
+    return bruto.decode("utf-8", "surrogateescape")
+
+
+def _fim_caminho_quotado(resto: str) -> int:
+    """Índice da aspa de fecho de um caminho quotado que abre `resto`."""
+    i = 1
+    while i < len(resto):
+        if resto[i] == "\\":
+            i += 2
+            continue
+        if resto[i] == '"':
+            return i
+        i += 1
+    return -1
+
+
 def arquivos_do_diff(texto: str) -> list[str]:
     """Caminhos b/... das linhas `diff --git a/X b/Y` do texto, sem repetir.
 
-    Devolve o destino `Y`, na ordem de aparição.
+    Devolve o destino `Y`, na ordem de aparição. Caminhos com quoting
+    do Git (nomes acentuados/especiais, entre aspas) são decodificados.
     """
     arquivos: list[str] = []
     vistos: set[str] = set()
@@ -3446,12 +3494,28 @@ def arquivos_do_diff(texto: str) -> list[str]:
         if not linha.startswith("diff --git "):
             continue
         resto = linha[len("diff --git "):]
-        if not resto.startswith("a/"):
+        destino_token: str | None = None
+        if resto.startswith('"'):
+            fim = _fim_caminho_quotado(resto)
+            if fim < 0:
+                continue
+            destino_token = resto[fim + 1:].strip()
+            if not destino_token:
+                continue
+        elif resto.startswith("a/"):
+            meio = resto.find(" b/")
+            if meio >= 0:
+                destino_token = resto[meio + 1:]
+            else:
+                meio_q = resto.find(' "b/')
+                if meio_q < 0:
+                    continue
+                destino_token = resto[meio_q + 1:]
+        else:
             continue
-        meio = resto.find(" b/")
-        if meio < 0:
-            continue
-        destino = resto[meio + 3:]
+        destino = _decodificar_caminho_git(destino_token)
+        if destino.startswith("b/"):
+            destino = destino[2:]
         if destino and destino not in vistos:
             vistos.add(destino)
             arquivos.append(destino)
@@ -3487,12 +3551,19 @@ def montar_prompt_conferencia(repo: str, commits: str, aceite: str,
 def conferir_aceite_partes(repo: str, commits: str, aceite: str, texto: str,
                            total: int, chaves: list[str],
                            risco_alto: list[str] | None,
-                           contexto_repo: str | None) -> tuple[str, str, str | None]:
+                           contexto_repo: str | None,
+                           arvore: str | None = None) -> tuple[str, str, str | None]:
     """Conferência final de aceite: uma chamada extra após todas aprovarem.
 
-    Devolve (veredito, saída, família do revisor).
+    Devolve (veredito, saída, família do revisor). A árvore revisada
+    (`arvore`, árvore da ponta) entra na chave quando dada: a conferência
+    lê o repositório, não só o diff — o mesmo patch sobre outra base
+    (outras dependências/testes) não reaproveita a aprovação.
     """
-    chave = chave_parte("conferencia\n" + "\n".join(chaves), risco_alto,
+    material = "conferencia\n" + "\n".join(chaves)
+    if arvore:
+        material += f"\narvore:{arvore}"
+    chave = chave_parte(material, risco_alto,
                         contexto_repo, aceite, True)
     if cache_parte_ativo(repo) and cache_veredito_ativo(repo):
         familia_cache = ler_cache_parte(chave)
@@ -3516,7 +3587,8 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
                        intencao: str | None = None,
                        evidencia: str | None = None,
                        contexto_repo: str | None = None,
-                       delta_correcao: str | None = None) -> tuple[str, str, set[str]]:
+                       delta_correcao: str | None = None,
+                       arvore: str | None = None) -> tuple[str, str, set[str]]:
     """Revisa o texto em partes; APROVADO só se TODAS as partes aprovarem.
 
     Qualquer REPROVADO reprova o conjunto (relatório = concatenação das partes
@@ -3561,7 +3633,7 @@ def revisar_por_partes(texto: str, repo: str, commits: str,
         if total > 1 and aceite:
             veredito_c, saida_c, familia_c = conferir_aceite_partes(
                 repo, commits, aceite, texto, total, chaves, risco_alto,
-                contexto_repo)
+                contexto_repo, arvore=arvore)
             somadas = set(familias)
             if familia_c is not None:
                 somadas.add(familia_c)
@@ -3742,6 +3814,13 @@ def gravar_cache_parte(chave: str, resumo: str) -> None:
 
 # --------------------------------------------------- cache de veredito (árvores)
 
+# Versão do cache de árvore com aceite: aprovações gravadas antes da
+# conferência final de aceite (sem `-v…` na chave) não valem para diff
+# multipartes com critérios, pois podem ter sido aprovadas por partes sem
+# verificação integral dos critérios.
+VERSAO_CACHE_ARVORE_ACEITE = 1
+
+
 def cache_veredito_ativo(topo: str | None = None) -> bool:
     """`revisor.cacheVeredito` (padrão true); só `false` desliga o cache."""
     p = git(["config", "--get", "revisor.cacheVeredito"], cwd=topo)
@@ -3779,13 +3858,19 @@ def revisar_diff(base: str, ponta: str, topo: str, commits: str,
     gravar; vereditos que não são APROVADO nunca são gravados, e nem os
     APROVADO cujas famílias incluem o próprio modelo (glm/muse) ou
     "desconhecido" (rodapé ausente): quem chama barraria por autorrevisão
-    e o revisor independente precisa ser ouvido de novo.
+    e o revisor independente precisa ser ouvido de novo. Com critérios de
+    aceite, a chave é versionada (`VERSAO_CACHE_ARVORE_ACEITE`): aprovações
+    de árvore anteriores à conferência final não são reaproveitadas. A
+    árvore da ponta é repassada à conferência final de aceite.
     """
-    chave = f"{arvore_de(base)}-{arvore_de(ponta)}"
+    arvore_ponta = arvore_de(ponta)
+    chave = f"{arvore_de(base)}-{arvore_ponta}"
     aceite = aceite_da_intencao(kw.get("intencao"))
     if aceite:
-        # critério de aceite muda o que o revisor cobra da mesma árvore
+        # critério de aceite muda o que o revisor cobra da mesma árvore;
+        # a versão invalida aprovações anteriores à conferência final
         chave += "-a" + hashlib.sha256(aceite.encode("utf-8")).hexdigest()[:16]
+        chave += f"-v{VERSAO_CACHE_ARVORE_ACEITE}"
     arquivo = caminho_cache_veredito(chave)
     em_correcao = kw.get("relatorio_anterior") is not None
     if cache_veredito_ativo(topo) and not em_correcao and arquivo.exists():
@@ -3800,6 +3885,7 @@ def revisar_diff(base: str, ponta: str, topo: str, commits: str,
             return ("APROVADO", dados["resumo"] + " (cache de árvore)",
                     set(dados["familias"]))
     kw.setdefault("contexto_repo", ler_contexto_repo(ponta))
+    kw.setdefault("arvore", arvore_ponta)
     veredito, saida, familias = revisar_por_partes(diff_entre(base, ponta),
                                                    topo, commits, **kw)
     if (veredito == "APROVADO" and familias

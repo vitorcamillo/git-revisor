@@ -467,6 +467,51 @@ def test_revisar_diff_cache_de_arvore_nao_cobre_aceite_novo(
     assert len(chamadas) == 2                                # e fica em cache
 
 
+def test_revisar_diff_cache_arvore_legado_com_aceite_nao_aprova(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Migração: aprovação de árvore pré-conferência (sem versão) não vale."""
+    base = _commit(repo, {"a.txt": "1\n"}, "feat: base")
+    ponta = _commit(repo, {"a.txt": "2\n"}, "feat: muda")
+    chamadas: list[str | None] = []
+
+    def falso(texto, topo, commits, **kw):
+        chamadas.append(kw.get("intencao"))
+        return "APROVADO", "ok", {"codex"}
+
+    monkeypatch.setattr(mod, "revisar_por_partes", falso)
+    com = f"feat: muda\n{mod.MARCADOR_ACEITE}\n1. [{ponta[:7]}] regra a"
+    aceite = mod.aceite_da_intencao(com)
+    legada = (f"{mod.arvore_de(base)}-{mod.arvore_de(ponta)}-a"
+              + hashlib.sha256(aceite.encode("utf-8")).hexdigest()[:16])
+    arquivo_legado = mod.caminho_cache_veredito(legada)
+    arquivo_legado.parent.mkdir(parents=True, exist_ok=True)
+    arquivo_legado.write_text(json.dumps(
+        {"quando": "antes", "resumo": "ok legado",
+         "familias": ["codex"]}) + "\n", encoding="utf-8")
+    veredito, _saida, _familias = mod.revisar_diff(
+        base, ponta, str(repo), "c", intencao=com)
+    assert veredito == "APROVADO"
+    assert len(chamadas) == 1  # legado ignorado: revisor chamado de novo
+    mod.revisar_diff(base, ponta, str(repo), "c", intencao=com)
+    assert len(chamadas) == 1  # aprovação nova (versionada) fica em cache
+
+
+def test_revisar_diff_repassa_arvore_da_ponta(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A conferência recebe a árvore da ponta revisada."""
+    base = _commit(repo, {"a.txt": "1\n"}, "feat: base")
+    ponta = _commit(repo, {"a.txt": "2\n"}, "feat: muda")
+    recebidas: list[str | None] = []
+
+    def falso(texto, topo, commits, **kw):
+        recebidas.append(kw.get("arvore"))
+        return "APROVADO", "ok", {"codex"}
+
+    monkeypatch.setattr(mod, "revisar_por_partes", falso)
+    mod.revisar_diff(base, ponta, str(repo), "c")
+    assert recebidas == [mod.arvore_de(ponta)]
+
+
 # ------------------------------------------- conferência final de aceite
 
 _RODAPE_CODEX = "--- codex-ask: modo=review gpt ---"
@@ -607,6 +652,32 @@ def test_conferencia_em_cache_na_segunda_chamada(
     assert len(chamadas) == 3  # nada novo: partes e conferência em cache
 
 
+def test_conferencia_outra_arvore_roda_de_novo(
+        repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mesmo diff sobre outra árvore: a conferência não reaproveita cache."""
+    _duas_partes(monkeypatch)
+    chamadas: list[str] = []
+    monkeypatch.setattr(
+        mod, "revisar_com_ia",
+        lambda prompt, cwd: (chamadas.append(prompt),
+                             ("APROVADO", _OK_PARTE))[1])
+    intencao = _intencao_regra_a()
+    texto = _texto_conferencia()
+    mod.revisar_por_partes(texto, str(repo), "abc1234",
+                           intencao=intencao, arvore="arvore-a")
+    assert len(chamadas) == 3
+    mod.revisar_por_partes(texto, str(repo), "abc1234",
+                           intencao=intencao, arvore="arvore-b")
+    conferencias = [p for p in chamadas
+                    if "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in p]
+    assert len(conferencias) == 2  # partes em cache, conferência refeita
+    mod.revisar_por_partes(texto, str(repo), "abc1234",
+                           intencao=intencao, arvore="arvore-b")
+    conferencias = [p for p in chamadas
+                    if "CONFERÊNCIA DE CRITÉRIOS DE ACEITE" in p]
+    assert len(conferencias) == 2  # mesma árvore: conferência em cache
+
+
 def test_conferencia_roda_de_novo_com_outro_criterio(
         repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Mesmas 2 partes com outro critério: a conferência roda de novo."""
@@ -674,6 +745,14 @@ def test_arquivos_do_diff_dois_repeticao_e_rename() -> None:
              "diff --git a/antigo.txt b/novo.txt\n+z\n")
     assert mod.arquivos_do_diff(texto) == ["a.txt", "novo.txt"]
     assert mod.arquivos_do_diff("sem diff aqui") == []
+
+
+def test_arquivos_do_diff_nome_acentuado_quotado() -> None:
+    """Quoting do Git (nomes acentuados) é decodificado, não omitido."""
+    texto = ('diff --git "a/p\\303\\241gina.txt" "b/p\\303\\241gina.txt"\n'
+             "+x\n"
+             'diff --git a/velho.txt "b/relat\\303\\263rio.txt"\n+y\n')
+    assert mod.arquivos_do_diff(texto) == ["página.txt", "relatório.txt"]
 
 
 def test_montar_prompt_conferencia_mais_de_60() -> None:
