@@ -6,6 +6,9 @@ import pytest
 @pytest.fixture(autouse=True)
 def cache_isolado(tmp_path, monkeypatch, request):
     """Isola o cache de repositório em cada teste."""
+    # QA cliente é ligado por padrão: fora da suíte de QA, nenhum teste
+    # pode disparar QA real (os testes de QA removem esta variável).
+    monkeypatch.setenv("REVISOR_QA", "0")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # lock de checks real fica fora
     # ordem.json real da máquina (painel Harness) mudaria a cadeia de correção

@@ -128,6 +128,7 @@ Os checks determinísticos e o comportamento por repositório saem da configura�
 | `revisor.ordem` | `ia-primeiro` | Com `check-primeiro`, o check completo roda antes da IA. |
 | `revisor.autopush` | `false` | Com `true`, empurra sozinho após aprovar ou aplicar a correção. |
 | `revisor.segundoPlano` | `false` | Com `true`, cada commit é revisado ao ser criado; senão, só no push. |
+| `revisor.qa` | `true` | Com `false`, desliga o QA cliente neste repositório. |
 | `revisor.baixoRisco` / `revisor.altoRisco` | — | Globs extras que se somam às listas internas de triagem por risco. |
 | `revisor.rodadas` | `2` | Máximo de tentativas de correção do worker. |
 
@@ -154,13 +155,19 @@ git config revisor.autopush true
 
 ## QA cliente
 
-Após um push aprovado, o revisor pode rodar um QA que usa o produto como cliente (navegador sem janela, API, erros forçados). Ele lê os critérios `Aceite:` dos commits e devolve achados com prova; um verificador independente reexecuta as provas e só o confirmado vale. Nunca bloqueia o push e é opt-in por repositório.
+Após um push aprovado, o revisor pode rodar um QA que usa o produto como cliente (navegador sem janela, API, erros forçados). Ele lê os critérios `Aceite:` dos commits e devolve achados com prova; um verificador independente reexecuta as provas e só o confirmado vale. Nunca bloqueia o push e é ligado por padrão.
 
-Para ligar, configure e commite o roteiro (alvos e jornadas a percorrer):
+O roteiro do QA vem, nesta ordem: `.revisor/qa.md` versionado no commit; senão `.git/revisor/qa/roteiro.md` local; senão é gerado automaticamente lendo o repositório (alvos do próprio produto, jornadas sem login, proibições e linha `ESPERA:`) e gravado nesse arquivo local. Para sobrescrever, edite o arquivo local ou commite `.revisor/qa.md` (que tem prioridade); o conteúdo gerado nunca é executado como shell. Se o repositório não tem produto usável de fora (biblioteca, script, CLI sem servidor), a geração responde `SEM_ALVO:` e o QA sai PULADO, com marcador local de 30 dias (enquanto vivo, nem dispara; `git revisor status` mostra `qa: sem alvo`).
+
+Para desligar:
 
 ```bash
-git config revisor.qa true
+git config revisor.qa false
 ```
+
+(`REVISOR_QA=0` no ambiente também desliga.)
+
+Sem `revisor.qaPronto`, a linha `ESPERA: <segundos>` do roteiro vira espera antes do QA, contada do início da execução (teto `REVISOR_QA_ESPERA`); com `qaPronto`, vale a espera atual pelo remoto e pela prontidão.
 
 Opcional: `.revisor/qa-armadilhas.md` versionado lista falsos positivos conhecidos; o QA aprende outros sozinho em `.git/revisor/qa/armadilhas.md`.
 
@@ -169,11 +176,13 @@ Opcional: `.revisor/qa-armadilhas.md` versionado lista falsos positivos conhecid
 | `REVISOR_CMD_QA` | `codex-ask --mode qa` | Agente que usa o produto como cliente. |
 | `REVISOR_CMD_QA2` | `claude-ask --mode qa` | Agente reserva quando o principal está sem cota (saída 75). |
 | `REVISOR_CMD_QA_VERIFICAR` | `claude-ask --mode qa` | Verificador independente das provas. |
+| `REVISOR_CMD_QA_ROTEIRO` | `codex-ask --mode plan` | Gerador do roteiro quando não há versionado nem local. |
+| `REVISOR_CMD_QA_ROTEIRO2` | `claude-ask --mode plan` | Reserva do gerador quando o principal está sem cota (saída 75). |
 | `REVISOR_QA_TIMEOUT` | `1500` | Timeout em segundos de cada chamada do QA. |
-| `REVISOR_QA_ESPERA` | `1200` | Teto em segundos da espera pelo remoto e pelo `revisor.qaPronto`. |
+| `REVISOR_QA_ESPERA` | `1200` | Teto em segundos da espera (`ESPERA:` do roteiro ou remoto + `revisor.qaPronto`). |
 | `REVISOR_QA_INTERVALO` | `20` | Intervalo em segundos entre sondagens da espera. |
 | `REVISOR_QA_RODADAS` | `2` | Limite de rodadas de correção automática por cadeia. |
-| `REVISOR_QA` | — | Com `0`, desliga o QA mesmo configurado. |
+| `REVISOR_QA` | — | Com `0`, desliga o QA (ligado por padrão). |
 
 Limites conhecidos: uma execução por repositório (push novo encerra a anterior de outro sha); `revisor.qaPronto` (linha de shell rodada em `sh -c` com `REVISOR_QA_SHA`, exit 0 libera) segura o QA até o ambiente ficar pronto; sem correção automática por padrão — `git config revisor.qaCorrigir true` liga (a correção passa por revisão e novo QA, até o limite de rodadas); só achado BAIXA confirmado vai para `.git/revisor/qa/baixa.md`, sem notificar.
 

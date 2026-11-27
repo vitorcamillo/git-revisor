@@ -128,6 +128,7 @@ Deterministic checks and per-repository behavior come from the local Git configu
 | `revisor.ordem` | `ia-primeiro` | With `check-primeiro`, the full check runs before the AI. |
 | `revisor.autopush` | `false` | With `true`, pushes automatically after approving or applying the fix. |
 | `revisor.segundoPlano` | `false` | With `true`, each commit is reviewed when created; otherwise, only on push. |
+| `revisor.qa` | `true` | With `false`, turns the client QA off in this repository. |
 | `revisor.baixoRisco` / `revisor.altoRisco` | — | Extra globs added to the built-in risk triage lists. |
 | `revisor.rodadas` | `2` | Maximum worker fix attempts. |
 
@@ -152,13 +153,19 @@ git config revisor.autopush true
 
 ## Client QA
 
-After an approved push, the reviewer can run a QA that uses the product as a client (headless browser, API, forced errors). It reads the `Aceite:` criteria from the commits and returns findings with proof; an independent verifier re-runs the proofs and only confirmed findings count. It never blocks the push and is opt-in per repository.
+After an approved push, the reviewer can run a QA that uses the product as a client (headless browser, API, forced errors). It reads the `Aceite:` criteria from the commits and returns findings with proof; an independent verifier re-runs the proofs and only confirmed findings count. It never blocks the push and is on by default.
 
-To enable it, configure and commit the script (targets and journeys to cover):
+The QA script comes, in this order: versioned `.revisor/qa.md` in the commit; otherwise the local `.git/revisor/qa/roteiro.md`; otherwise it is generated automatically by reading the repository (own-product targets, login-free journeys, prohibitions, and an `ESPERA:` line) and saved to that local file. To override, edit the local file or commit `.revisor/qa.md` (which takes priority); generated content is never executed as shell. If the repository has no externally usable product (library, script, CLI without a server), generation answers `SEM_ALVO:` and QA reports PULADO, with a local 30-day marker (while live, nothing is even dispatched; `git revisor status` shows `qa: sem alvo`).
+
+To turn it off:
 
 ```bash
-git config revisor.qa true
+git config revisor.qa false
 ```
+
+(`REVISOR_QA=0` in the environment also turns it off.)
+
+Without `revisor.qaPronto`, the script's `ESPERA: <seconds>` line becomes the wait before QA, counted from the start of the run (`REVISOR_QA_ESPERA` ceiling); with `qaPronto`, the current wait for the remote and for readiness applies.
 
 Optional: a versioned `.revisor/qa-armadilhas.md` lists known false positives; the QA learns more on its own in `.git/revisor/qa/armadilhas.md`.
 
@@ -167,11 +174,13 @@ Optional: a versioned `.revisor/qa-armadilhas.md` lists known false positives; t
 | `REVISOR_CMD_QA` | `codex-ask --mode qa` | Agent that uses the product as a client. |
 | `REVISOR_CMD_QA2` | `claude-ask --mode qa` | Fallback agent when the main one is out of quota (exit 75). |
 | `REVISOR_CMD_QA_VERIFICAR` | `claude-ask --mode qa` | Independent verifier of the proofs. |
+| `REVISOR_CMD_QA_ROTEIRO` | `codex-ask --mode plan` | Script generator when neither versioned nor local script exists. |
+| `REVISOR_CMD_QA_ROTEIRO2` | `claude-ask --mode plan` | Generator fallback when the main one is out of quota (exit 75). |
 | `REVISOR_QA_TIMEOUT` | `1500` | Timeout in seconds for each QA call. |
-| `REVISOR_QA_ESPERA` | `1200` | Ceiling in seconds for waiting on the remote and on `revisor.qaPronto`. |
+| `REVISOR_QA_ESPERA` | `1200` | Ceiling in seconds for the wait (script `ESPERA:` or remote + `revisor.qaPronto`). |
 | `REVISOR_QA_INTERVALO` | `20` | Interval in seconds between wait polls. |
 | `REVISOR_QA_RODADAS` | `2` | Limit of automatic fix rounds per chain. |
-| `REVISOR_QA` | — | With `0`, turns QA off even when configured. |
+| `REVISOR_QA` | — | With `0`, turns QA off (on by default). |
 
 Known limits: one run per repository (a new push ends the previous one for another sha); `revisor.qaPronto` (a shell line run via `sh -c` with `REVISOR_QA_SHA`, exit 0 releases) holds QA until the environment is ready; no automatic fix by default — `git config revisor.qaCorrigir true` enables it (the fix goes through review and a new QA, up to the round limit); only confirmed BAIXA findings go to `.git/revisor/qa/baixa.md`, without notifying.
 
