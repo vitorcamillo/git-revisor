@@ -659,6 +659,29 @@ def test_sem_cota_usa_agente_reserva(
     assert "QA: APROVADO" in relatorio
 
 
+def test_sem_cota_reserva_sem_veredito_nao_e_chamado_de_novo(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        sem_espera: None) -> None:
+    """O reserva chamado por falta de cota não recebe segunda chamada."""
+    sha = _liga_qa(repo)
+    principal = _stub(tmp_path / "q1.sh", "exit 75\n")
+    chamadas = tmp_path / "chamadas.txt"
+    reserva = _stub(
+        tmp_path / "q2.sh",
+        f'printf "chamada\\n" >> "{chamadas}"\n'
+        'printf "%s\\n" "resposta sem veredito"\n')
+    monkeypatch.setenv("REVISOR_CMD_QA", principal)
+    monkeypatch.setenv("REVISOR_CMD_QA2", reserva)
+
+    assert mod.cmd_qa(sha) == 0
+
+    relatorio = (repo / ".git" / "revisor" / "qa" / f"{sha}.md").read_text(
+        encoding="utf-8")
+    assert chamadas.read_text(encoding="utf-8").splitlines() == ["chamada"]
+    assert "QA: INDISPONIVEL" in relatorio
+    assert "resposta sem veredito" in relatorio
+
+
 # --------------------------------- critério 10 (REVISOR_QA global)
 
 def test_env_qa_zero_bloqueia_disparo(

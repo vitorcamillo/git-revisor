@@ -7389,12 +7389,14 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
     prompt = montar_prompt_qa(roteiro, armadilhas, aceite, sha, origem)
     tmp = tempfile.mkdtemp(prefix="revisor-qa-")
     cmd = comando("REVISOR_CMD_QA", "codex-ask --mode qa")
+    reserva_tentado = False
     codigo, saida = chamar_comando(cmd, tmp, [prompt], qa_timeout_s())
     if codigo == 75:
         # Sem cota no agente principal: tenta o reserva antes de desistir.
         cmd2 = comando("REVISOR_CMD_QA2", "claude-ask --mode qa")
         if cmd2 and cmd2 != cmd:
             log("qa: agente principal sem cota; tentando o reserva")
+            reserva_tentado = True
             codigo, saida = chamar_comando(cmd2, tmp, [prompt],
                                            qa_timeout_s())
     if codigo == 75:
@@ -7410,7 +7412,7 @@ def _cmd_qa_exec(sha: str, topo: str, remote: str | None,
     if interp["veredito"] not in ("APROVADO", "REPROVADO"):
         # Resposta fora do contrato: uma segunda chance com o outro agente.
         cmd2 = comando("REVISOR_CMD_QA2", "claude-ask --mode qa")
-        if cmd2 and cmd2 != cmd:
+        if cmd2 and cmd2 != cmd and not reserva_tentado:
             log("qa: resposta sem veredito; tentando o reserva")
             cod2, saida2 = chamar_comando(cmd2, tmp, [prompt],
                                           qa_timeout_s())
