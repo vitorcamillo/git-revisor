@@ -9,6 +9,9 @@ def cache_isolado(tmp_path, monkeypatch, request):
     # QA cliente é ligado por padrão: fora da suíte de QA, nenhum teste
     # pode disparar QA real (os testes de QA removem esta variável).
     monkeypatch.setenv("REVISOR_QA", "0")
+    # Sem tela: nenhum teste (nem subprocesso) dispara notify-send real.
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # lock de checks real fica fora
     # ordem.json real da máquina (painel Harness) mudaria a cadeia de correção

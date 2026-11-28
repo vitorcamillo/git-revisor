@@ -74,6 +74,12 @@ def _stub(caminho: Path, corpo: str) -> str:
     return str(caminho)
 
 
+@pytest.fixture(autouse=True)
+def reserva_falso(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Agente reserva nunca é o real nos testes (falha por padrão)."""
+    monkeypatch.setenv("REVISOR_CMD_QA2", "false")
+
+
 @pytest.fixture()
 def sem_espera(monkeypatch: pytest.MonkeyPatch) -> None:
     """Espera do QA zerada: sem dormir de verdade nos testes."""
@@ -325,9 +331,53 @@ def test_so_baixa_aprova_sem_notificar(
         encoding="utf-8")
     assert "QA: APROVADO" in relatorio
     assert "COBERTO: página inicial" in relatorio
+    assert "— CONFIRMADO: typo visível" in relatorio
     baixa = (_base_dir() / "qa" / "baixa.md").read_text(encoding="utf-8")
     assert "texto" in baixa
     assert "QA cliente:" not in _log()
+
+
+def test_sem_veredito_guarda_a_resposta_do_agente(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        sem_espera: None) -> None:
+    """Sem linha QA: o relatório mostra o que o agente respondeu."""
+    sha = _liga_qa(repo)
+    qa = _stub(tmp_path / "qa.sh",
+               'printf "%s\\n" "não consegui abrir o navegador"\n')
+    monkeypatch.setenv("REVISOR_CMD_QA", qa)
+    assert mod.cmd_qa(sha) == 0
+    relatorio = (_base_dir() / "qa" / f"{sha}.md").read_text(
+        encoding="utf-8")
+    assert "QA: INDISPONIVEL" in relatorio
+    assert "não consegui abrir o navegador" in relatorio
+    assert "\n" not in _log().strip().splitlines()[-1]
+    assert "navegador" not in _log()
+
+
+def test_sem_veredito_tenta_o_reserva(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        sem_espera: None) -> None:
+    """Resposta fora do contrato: o reserva responde e vale o dele."""
+    sha = _liga_qa(repo)
+    monkeypatch.setenv("REVISOR_CMD_QA", _stub(
+        tmp_path / "qa.sh", 'printf "%s\\n" "{json sem veredito}"\n'))
+    monkeypatch.setenv("REVISOR_CMD_QA2", _stub(
+        tmp_path / "qa2.sh",
+        'printf "%s\\n" "COBERTO: home" "QA: APROVADO"\n'))
+    assert mod.cmd_qa(sha) == 0
+    relatorio = (_base_dir() / "qa" / f"{sha}.md").read_text(
+        encoding="utf-8")
+    assert "QA: APROVADO" in relatorio
+    assert "COBERTO: home" in relatorio
+    assert "tentando o reserva" in _log()
+
+
+def test_prompt_nao_manda_procurar_arquivo_de_roteiro() -> None:
+    """Roteiro local/gerado vai inteiro no prompt, sem caminho de arquivo."""
+    for origem in ("local", "gerado"):
+        p = mod.montar_prompt_qa("ALVO: http://x", None, None, "abc", origem)
+        assert "roteiro.md" not in p
+        assert "ALVO: http://x" in p
 
 
 # ------------------------------------------------- critério 10 (status)
@@ -1088,7 +1138,7 @@ def test_sem_qaPronto_com_remoto_atualizado_roda_qa(
 def test_prompt_diz_origem() -> None:
     """O prompt diz a origem; gerado acrescenta o aviso de alvo."""
     gerado = mod.montar_prompt_qa("R", None, None, "abc", "gerado")
-    assert ".git/revisor/qa/roteiro.md" in gerado
+    assert "Roteiro gerado automaticamente" in gerado
     assert ("roteiro gerado automaticamente: se um alvo não responder ou "
             "não for do próprio projeto, não teste e diga isso") in gerado
     local = mod.montar_prompt_qa("R", None, None, "abc", "local")
@@ -1195,3 +1245,81 @@ def test_coberto_e_lido_do_contrato() -> None:
     assert interp["coberto"] == "home em 375 px, busca vazia e longa"
     assert mod.interpretar_qa("QA: APROVADO\n")["coberto"] is None
     assert "COBERTO:" in mod.QA_CONTRATO_SAIDA
+
+
+# ------------------------------------------- sobreviventes da mutação ampla
+
+def test_achado_nao_citado_pelo_verificador_nao_confirma() -> None:
+    """Verificador calado sobre um achado: ele fica não confirmado."""
+    assert mod.interpretar_verificacao("- [2] CONFIRMADO: ok", 3) == [
+        False, True, False]
+    assert mod.interpretar_verificacao("", 2) == [False, False]
+
+
+def test_armadilhas_locais_entram_e_vazio_devolve_none(repo: Path) -> None:
+    """Armadilha local vai para o prompt; sem nenhuma, None."""
+    sha = _liga_qa(repo)
+    assert mod.ler_qa_armadilhas(sha) is None
+    pasta = _base_dir() / "qa"
+    pasta.mkdir(parents=True, exist_ok=True)
+    (pasta / "armadilhas.md").write_text("- falso 404\n", encoding="utf-8")
+    assert mod.ler_qa_armadilhas(sha) == "- falso 404"
+
+
+def test_espera_curta_distingue_remoto_com_e_sem_o_sha(
+        repo: Path, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sha no remoto libera; sha fora dele estoura a espera com motivo."""
+    monkeypatch.setenv("REVISOR_QA_ESPERA", "1")
+    monkeypatch.setenv("REVISOR_QA_INTERVALO", "1")
+    _liga_qa(repo)
+    remoto = tmp_path / "remoto.git"
+    _git(repo, "init", "-q", "--bare", str(remoto))
+    _git(repo, "remote", "add", "origin", str(remoto))
+    ramo = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    ref = f"refs/heads/{ramo}"
+    dentro = _commit(repo, {"a.py": "1\n"}, "feat: a")
+    _git(repo, "push", "-q", "--no-verify", "-u", "origin", f"HEAD:{ref}")
+    assert mod._esperar_qa_liberar(dentro, str(repo), "origin", ref) == (
+        True, "")
+    assert mod._remoto_do_upstream(str(repo)) == ("origin", ref)
+    fora = _commit(repo, {"c.py": "3\n"}, "feat: c")
+    ok, motivo = mod._esperar_qa_liberar(fora, str(repo), "origin", ref)
+    assert not ok and "remoto sem" in motivo
+
+
+def test_sem_espera_e_pronto_falhando_culpa_o_pronto(
+        repo: Path, sem_espera: None) -> None:
+    """Sem remoto e com qaPronto falhando: o motivo é o qaPronto."""
+    sha = _liga_qa(repo)
+    _git(repo, "config", "revisor.qaPronto", "false")
+    ok, motivo = mod._esperar_qa_liberar(sha, str(repo), None, None)
+    assert not ok and "qaPronto" in motivo and "remoto sem" not in motivo
+
+
+def test_upstream_em_head_destacado_devolve_par_vazio(repo: Path) -> None:
+    """HEAD destacado não tem upstream: (None, None), sem quebrar."""
+    sha = _liga_qa(repo)
+    _git(repo, "checkout", "-q", "--detach", sha)
+    assert mod._remoto_do_upstream(str(repo)) == (None, None)
+
+
+def test_verificador_recebe_roteiro_e_proibicoes(
+        repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        sem_espera: None) -> None:
+    """O verificador vê o roteiro (conta de teste) e as proibições fixas."""
+    sha = _liga_qa(repo)
+    visto = tmp_path / "visto.txt"
+    monkeypatch.setenv("REVISOR_CMD_QA", _stub(
+        tmp_path / "qa.sh",
+        'printf "%s\\n" "- [ALTA] x — y — z" "PROVA: curl http://localhost:9/ '
+        '=> 500" "QA: REPROVADO"\n'))
+    monkeypatch.setenv("REVISOR_CMD_QA_VERIFICAR", _stub(
+        tmp_path / "ver.sh",
+        f'printf "%s" "$*" > {visto}\nprintf "%s\\n" "- [1] CONFIRMADO: ok"\n'))
+    assert mod.cmd_qa(sha) == 0
+    pedido = visto.read_text(encoding="utf-8")
+    assert "- abrir /" in pedido
+    assert mod.QA_PROIBICOES in pedido
+    assert "x" in mod.montar_prompt_verificacao(
+        [{"severidade": "ALTA", "titulo": "x", "prova": "p"}])
